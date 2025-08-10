@@ -32,3 +32,12 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Pipeline artifacts
+*.json
+*.tar.gz
+release/
+
+# Test files
+test_*.csv
+test_*.xlsx
