@@ -1,0 +1,30 @@
+2025-08-10 20:42:32,411 - ===== Script Started =====
+2025-08-10 20:42:32,412 - Input file: unclassified_drugs\A_Z_medicines_dataset_of_India.xlsx
+2025-08-10 20:44:47,525 - Antibiotics: +354
+2025-08-10 20:44:47,526 - Others: +6269
+2025-08-10 20:44:47,527 - Gastrointestinal: -111
+2025-08-10 20:44:47,527 - Pain_Inflammation + Fever_Cold_Cough: +280
+2025-08-10 20:44:47,528 - Pain_Inflammation: +1197
+2025-08-10 20:44:47,528 - Cardiac_Hypertension: +592
+2025-08-10 20:44:47,528 - Neurology_Psychiatry: +2
+2025-08-10 20:44:47,528 - Diabetes: +1
+2025-08-10 20:44:47,529 - Steroids_Hormones: +1063
+2025-08-10 20:44:47,529 - Antifungals: +52
+2025-08-10 20:44:47,530 - Vitamins_Supplements: -160
+2025-08-10 20:44:47,530 - Dermatology: -6
+2025-08-10 20:44:47,530 - Respiratory_Asthma: +114
+2025-08-10 20:44:47,530 - Urology: -223
+2025-08-10 20:44:47,531 - Antibiotics + Antidiarrheal_Antiprotozoal: +12
+2025-08-10 20:44:47,531 - Antifungals + Dermatology: -51
+2025-08-10 20:44:47,531 - Antibiotics + Steroids_Hormones: +1
+2025-08-10 20:44:47,531 - Antibiotics + Dermatology: -685
+2025-08-10 20:44:47,531 - AntiTB: +2
+2025-08-10 20:44:47,532 - Respiratory_Asthma + Steroids_Hormones: +257
+2025-08-10 20:44:47,532 - Antibiotics + Antifungals: +131
+2025-08-10 20:44:47,532 - Fever_Cold_Cough + Dermatology: +46
+2025-08-10 20:44:47,532 - Respiratory_Asthma + Dermatology: +30
+2025-08-10 20:44:47,532 - Vitamins_Supplements + AntiTB: -2
+2025-08-10 20:44:47,533 - Vitamins_Supplements + Dermatology: -2
+2025-08-10 20:44:47,533 - Antibiotics + Vitamins_Supplements: +3
+2025-08-10 20:44:47,533 - Dermatology + Eye_Ear: +3
+2025-08-10 20:49:46,473 - Script Finished. Time taken: 0:07:14.060231

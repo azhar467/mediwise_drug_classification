@@ -1,0 +1,75 @@
+2025-08-10 20:35:09,502 - ===== Script Started =====
+2025-08-10 20:35:09,502 - Input file: unclassified_drugs\A_Z_medicines_dataset_of_India.xlsx
+2025-08-10 20:37:25,512 - Antibiotics: -1565
+2025-08-10 20:37:25,513 - Others: +3723
+2025-08-10 20:37:25,513 - Gastrointestinal: -931
+2025-08-10 20:37:25,514 - Pain_Inflammation + Fever_Cold_Cough: -273
+2025-08-10 20:37:25,514 - Fever_Cold_Cough: -1925
+2025-08-10 20:37:25,514 - Neurology_Psychiatry: -2006
+2025-08-10 20:37:25,514 - Pain_Inflammation: +3147
+2025-08-10 20:37:25,515 - Cardiac_Hypertension: -4644
+2025-08-10 20:37:25,515 - Diabetes: +35
+2025-08-10 20:37:25,515 - Steroids_Hormones: +33
+2025-08-10 20:37:25,515 - Antifungals: -1453
+2025-08-10 20:37:25,516 - Vitamins_Supplements: +2391
+2025-08-10 20:37:25,516 - Other_Therapeutic: +5142
+2025-08-10 20:37:25,516 - Dermatology: +1238
+2025-08-10 20:37:25,516 - Antiparasitic_Antimalarial: +2872
+2025-08-10 20:37:25,517 - Respiratory_Asthma: -143
+2025-08-10 20:37:25,517 - Fever_Cold_Cough + Respiratory_Asthma: +2106
+2025-08-10 20:37:25,517 - Pain_Inflammation + Other_Therapeutic: +1381
+2025-08-10 20:37:25,517 - Urology: +1085
+2025-08-10 20:37:25,517 - Steroids_Hormones + Other_Therapeutic: +1054
+2025-08-10 20:37:25,517 - Antibiotics + Dermatology: +712
+2025-08-10 20:37:25,517 - Vitamins_Supplements + Neurology_Psychiatry: -1460
+2025-08-10 20:37:25,519 - Pain_Inflammation + Gastrointestinal: +295
+2025-08-10 20:37:25,519 - Cardiac_Hypertension + Other_Therapeutic: +592
+2025-08-10 20:37:25,519 - Antidiarrheal_Antiprotozoal: +572
+2025-08-10 20:37:25,519 - Antifungals + Dermatology: +95
+2025-08-10 20:37:25,519 - Oncology: +48
+2025-08-10 20:37:25,520 - Antibiotics + Antidiarrheal_Antiprotozoal: +525
+2025-08-10 20:37:25,520 - Antivirals: -1496
+2025-08-10 20:37:25,520 - Eye_Ear: +437
+2025-08-10 20:37:25,520 - Antibiotics + Steroids_Hormones: +32
+2025-08-10 20:37:25,521 - AntiTB: +340
+2025-08-10 20:37:25,521 - Pain_Inflammation + Fever_Cold_Cough + Vitamins_Supplements: +275
+2025-08-10 20:37:25,521 - Respiratory_Asthma + Steroids_Hormones + Other_Therapeutic: +257
+2025-08-10 20:37:25,521 - Antiplatelet_Anticoagulant: +225
+2025-08-10 20:37:25,522 - Antibiotics + Pain_Inflammation: +5
+2025-08-10 20:37:25,522 - Gastrointestinal + Vitamins_Supplements: -181
+2025-08-10 20:37:25,522 - Antibiotics + Antifungals + Dermatology: +131
+2025-08-10 20:37:25,522 - Antibiotics + Antifungals: -231
+2025-08-10 20:37:25,522 - Respiratory_Asthma + Other_Therapeutic: +114
+2025-08-10 20:37:25,522 - Antibiotics + Respiratory_Asthma: +112
+2025-08-10 20:37:25,523 - Cardiac_Hypertension + Vitamins_Supplements: -56
+2025-08-10 20:37:25,523 - Antibiotics + Gastrointestinal: +48
+2025-08-10 20:37:25,523 - Dermatology + Antidiarrheal_Antiprotozoal: +71
+2025-08-10 20:37:25,523 - Gastrointestinal + Other_Therapeutic: +57
+2025-08-10 20:37:25,523 - Fever_Cold_Cough + Dermatology + Other_Therapeutic: +46
+2025-08-10 20:37:25,524 - Antibiotics + Other_Therapeutic: +32
+2025-08-10 20:37:25,524 - Respiratory_Asthma + Dermatology + Other_Therapeutic: +30
+2025-08-10 20:37:25,524 - Pain_Inflammation + Vitamins_Supplements: -299
+2025-08-10 20:37:25,524 - Gastrointestinal + Neurology_Psychiatry: -2
+2025-08-10 20:37:25,524 - Dermatology + Other_Therapeutic: +21
+2025-08-10 20:37:25,525 - Pain_Inflammation + Steroids_Hormones: +11
+2025-08-10 20:37:25,525 - Gastrointestinal + Antidiarrheal_Antiprotozoal: +17
+2025-08-10 20:37:25,525 - Vitamins_Supplements + AntiTB: +15
+2025-08-10 20:37:25,525 - Gastrointestinal + Dermatology: +12
+2025-08-10 20:37:25,525 - Antibiotics + Dermatology + Antidiarrheal_Antiprotozoal: +12
+2025-08-10 20:37:25,526 - Vitamins_Supplements + Dermatology: +2
+2025-08-10 20:37:25,526 - Steroids_Hormones + Urology: +9
+2025-08-10 20:37:25,526 - Pain_Inflammation + Fever_Cold_Cough + Respiratory_Asthma: +8
+2025-08-10 20:37:25,526 - Vitamins_Supplements + Steroids_Hormones: -1041
+2025-08-10 20:37:25,526 - Pain_Inflammation + Fever_Cold_Cough + Other_Therapeutic: +5
+2025-08-10 20:37:25,527 - Antibiotics + Vitamins_Supplements + Dermatology: +3
+2025-08-10 20:37:25,527 - Dermatology + Eye_Ear + Other_Therapeutic: +3
+2025-08-10 20:37:25,527 - Antifungals + Antidiarrheal_Antiprotozoal: +2
+2025-08-10 20:37:25,527 - Antibiotics + Vitamins_Supplements: -68
+2025-08-10 20:37:25,528 - Pain_Inflammation + Neurology_Psychiatry: -31
+2025-08-10 20:37:25,528 - Neurology_Psychiatry + Other_Therapeutic: +2
+2025-08-10 20:37:25,528 - Antifungals + Dermatology + Other_Therapeutic: +1
+2025-08-10 20:37:25,528 - Antibiotics + Steroids_Hormones + Dermatology: +1
+2025-08-10 20:37:25,529 - Diabetes + Other_Therapeutic: +1
+2025-08-10 20:37:25,529 - Cardiac_Hypertension + Gastrointestinal: -2
+2025-08-10 20:37:25,529 - Fever_Cold_Cough + Gastrointestinal: -567
+2025-08-10 20:42:08,729 - Script Finished. Time taken: 0:06:59.227978

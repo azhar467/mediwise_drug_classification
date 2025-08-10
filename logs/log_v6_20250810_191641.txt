@@ -1,0 +1,3 @@
+2025-08-10 19:16:41,531 - ===== Script Started =====
+2025-08-10 19:16:41,533 - Input file: unclassified_drugs\A_Z_medicines_dataset_of_India.xlsx
+2025-08-10 19:22:59,908 - Script Finished. Time taken: 0:06:18.379869

@@ -1,0 +1,48 @@
+2025-08-10 17:38:02,650 - ===== Script Started =====
+2025-08-10 17:38:02,651 - Input file: unclassified_drugs\A_Z_medicines_dataset_of_India.xlsx
+2025-08-10 17:44:38,474 - 
+===== Classification Summary =====
+                                                   Category  Count  Percentage
+                                                     Others  91739       36.12
+                                                Antibiotics  53573       21.09
+                                           Gastrointestinal  20627        8.12
+                       Pain_Inflammation + Fever_Cold_Cough  17682        6.96
+                                           Fever_Cold_Cough  14818        5.83
+                                       Cardiac_Hypertension  10811        4.26
+                                                   Diabetes  10256        4.04
+                                          Pain_Inflammation   9424        3.71
+                                       Neurology_Psychiatry   6733        2.65
+                                                Antifungals   6403        2.52
+                                          Steroids_Hormones   3258        1.28
+                                         Respiratory_Asthma   1884        0.74
+                                       Vitamins_Supplements   1770        0.70
+                                                Dermatology   1667        0.66
+                                                   Oncology    503        0.20
+                                                 Antivirals    474        0.19
+                                  Antifungals + Dermatology    465        0.18
+                       Pain_Inflammation + Gastrointestinal    398        0.16
+                                  Antibiotics + Dermatology    317        0.12
+                            Antifungals + Steroids_Hormones    274        0.11
+                                  Antibiotics + Antifungals    248        0.10
+                         Antifungals + Vitamins_Supplements    233        0.09
+    Pain_Inflammation + Fever_Cold_Cough + Gastrointestinal    180        0.07
+                            Antibiotics + Steroids_Hormones     71        0.03
+                     Respiratory_Asthma + Steroids_Hormones     36        0.01
+                   Pain_Inflammation + Vitamins_Supplements     29        0.01
+                Vitamins_Supplements + Neurology_Psychiatry     18        0.01
+                             Antibiotics + Gastrointestinal     16        0.01
+                      Fever_Cold_Cough + Respiratory_Asthma     14        0.01
+                       Fever_Cold_Cough + Steroids_Hormones     10        0.00
+                         Vitamins_Supplements + Dermatology      8        0.00
+                      Pain_Inflammation + Steroids_Hormones      7        0.00
+                   Vitamins_Supplements + Steroids_Hormones      5        0.00
+                         Antibiotics + Vitamins_Supplements      5        0.00
+                    Gastrointestinal + Vitamins_Supplements      5        0.00
+                    Fever_Cold_Cough + Vitamins_Supplements      3        0.00
+                    Gastrointestinal + Neurology_Psychiatry      2        0.00
+                   Pain_Inflammation + Neurology_Psychiatry      2        0.00
+Pain_Inflammation + Fever_Cold_Cough + Neurology_Psychiatry      2        0.00
+Pain_Inflammation + Fever_Cold_Cough + Cardiac_Hypertension      1        0.00
+                    Cardiac_Hypertension + Gastrointestinal      1        0.00
+                            Steroids_Hormones + Dermatology      1        0.00
+2025-08-10 17:44:38,477 - Total execution time: 395.83 seconds

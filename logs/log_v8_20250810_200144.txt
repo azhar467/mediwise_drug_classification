@@ -1,0 +1,49 @@
+2025-08-10 20:01:44,367 - ===== Script Started =====
+2025-08-10 20:01:44,368 - Input file: unclassified_drugs\A_Z_medicines_dataset_of_India.xlsx
+2025-08-10 20:04:56,326 - Antibiotics: +3141
+2025-08-10 20:04:56,329 - Others: -18903
+2025-08-10 20:04:56,329 - Gastrointestinal: +304
+2025-08-10 20:04:56,330 - Cardiac_Hypertension: +1101
+2025-08-10 20:04:56,331 - Fever_Cold_Cough: +355
+2025-08-10 20:04:56,332 - Neurology_Psychiatry: +4703
+2025-08-10 20:04:56,333 - Diabetes: +1013
+2025-08-10 20:04:56,333 - Pain_Inflammation: -22
+2025-08-10 20:04:56,334 - Steroids_Hormones: +619
+2025-08-10 20:04:56,334 - Antifungals: +316
+2025-08-10 20:04:56,334 - Vitamins_Supplements: -321
+2025-08-10 20:04:56,335 - Respiratory_Asthma: +557
+2025-08-10 20:04:56,336 - Dermatology: +577
+2025-08-10 20:04:56,336 - Vitamins_Supplements + Neurology_Psychiatry: +9
+2025-08-10 20:04:56,337 - Antivirals: +1509
+2025-08-10 20:04:56,337 - Enzymes: -13
+2025-08-10 20:04:56,338 - Fever_Cold_Cough + Gastrointestinal: +568
+2025-08-10 20:04:56,338 - Hemostatics: +516
+2025-08-10 20:04:56,338 - Erectile_Dysfunction: +447
+2025-08-10 20:04:56,339 - Cardiac_Hypertension + Neurology_Psychiatry: +429
+2025-08-10 20:04:56,339 - Cardiac_Hypertension + Hair_Growth: +370
+2025-08-10 20:04:56,339 - Pain_Inflammation + Hemostatics: +370
+2025-08-10 20:04:56,339 - Antifungals + Immunosuppressants: +363
+2025-08-10 20:04:56,339 - Antibiotics + Steroids_Hormones: +188
+2025-08-10 20:04:56,340 - Antibiotics + Antifungals: +100
+2025-08-10 20:04:56,341 - Antifungals + Steroids_Hormones: +76
+2025-08-10 20:04:56,341 - Tuberculosis: +342
+2025-08-10 20:04:56,342 - Antibiotics + Dermatology: +11
+2025-08-10 20:04:56,342 - Pain_Inflammation + Vitamins_Supplements: +299
+2025-08-10 20:04:56,343 - Gastrointestinal + Vitamins_Supplements: +311
+2025-08-10 20:04:56,343 - Steroids_Hormones + Dermatology: +235
+2025-08-10 20:04:56,344 - Antibiotics + Pain_Inflammation: +135
+2025-08-10 20:04:56,344 - Cardiac_Hypertension + Vitamins_Supplements: +85
+2025-08-10 20:04:56,345 - Antibiotics + Vitamins_Supplements: +65
+2025-08-10 20:04:56,346 - Fever_Cold_Cough + Respiratory_Asthma: +48
+2025-08-10 20:04:56,346 - Respiratory_Asthma + Steroids_Hormones: +12
+2025-08-10 20:04:56,347 - Antibiotics + Gastrointestinal: +19
+2025-08-10 20:04:56,347 - Antibiotics + Enzymes: +13
+2025-08-10 20:04:56,347 - Gastrointestinal + Neurology_Psychiatry: +20
+2025-08-10 20:04:56,347 - Gastrointestinal + Tuberculosis: +13
+2025-08-10 20:04:56,349 - Antifungals + Gastrointestinal: +12
+2025-08-10 20:04:56,349 - Cardiac_Hypertension + Gastrointestinal: +2
+2025-08-10 20:04:56,350 - Cardiac_Hypertension + Steroids_Hormones + Hair_Growth: +2
+2025-08-10 20:04:56,351 - Vitamins_Supplements + Hemostatics: +2
+2025-08-10 20:04:56,351 - Gastrointestinal + Steroids_Hormones: +1
+2025-08-10 20:04:56,352 - Antibiotics + Respiratory_Asthma: +1
+2025-08-10 20:09:55,830 - Script Finished. Time taken: 0:08:11.457911
