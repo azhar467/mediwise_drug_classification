@@ -20,9 +20,9 @@ INPUT_FOLDER = "unclassified_drugs"
 OUTPUT_EXCEL_FOLDER = "classified_drugs/excel"
 OUTPUT_CSV_FOLDER = "classified_drugs/csv"
 LOG_FOLDER = "logs"
-METADATA_FILE = os.path.join(LOG_FOLDER, "category_counts.json")  # For tracking category changes
+METADATA_FILE = os.path.join(LOG_FOLDER, "category_counts.json")
 
-INPUT_FILENAME = None  # Optional: specify filename here
+INPUT_FILENAME = None
 NUM_WORKERS = None
 
 COL_COMP1 = "short_composition1"
@@ -211,6 +211,7 @@ def main():
 
     csv_out = os.path.join(OUTPUT_CSV_FOLDER, f"mediwise_classified_v{version}_{timestamp}.csv")
     df_out.to_csv(csv_out, index=False)
+    print(Fore.YELLOW + f"CSV saved: {csv_out}")
 
     excel_out = os.path.join(OUTPUT_EXCEL_FOLDER, f"mediwise_classified_v{version}_{timestamp}.xlsx")
     with pd.ExcelWriter(excel_out, engine="xlsxwriter") as writer:
@@ -218,25 +219,16 @@ def main():
         for cat in sorted(df_out["Category"].unique()):
             df_cat = df_out[df_out["Category"] == cat]
             df_cat.to_excel(writer, sheet_name=cat[:31], index=False)
-            if cat == "Others":
-                workbook = writer.book
-                worksheet = writer.sheets[cat[:31]]
-                yellow_format = workbook.add_format({'bg_color': '#FFFF99'})
-                nrows, ncols = df_cat.shape
-                worksheet.set_column(0, ncols - 1, None, yellow_format)
 
     summary_out = os.path.join(OUTPUT_EXCEL_FOLDER, f"classification_summary_v{version}_{timestamp}.xlsx")
     summary = pd.DataFrame(list(current_counts.items()), columns=["Category", "Count"])
     summary["Percentage"] = (summary["Count"] / len(df_out) * 100).round(2)
     others_keywords_df = extract_others_keywords(df_out)
-
     with pd.ExcelWriter(summary_out, engine="xlsxwriter") as writer:
         summary.to_excel(writer, sheet_name="Summary", index=False)
         others_keywords_df.to_excel(writer, sheet_name="Others_Keywords", index=False)
 
-    end_time = datetime.now()
-    print(Fore.CYAN + f"===== Script Finished at {end_time} (Time taken: {end_time - start_time}) =====")
-    logging.info(f"Script Finished. Time taken: {end_time - start_time}")
+    print(Fore.CYAN + f"===== Script Finished at {datetime.now()} (Time taken: {datetime.now() - start_time}) =====")
 
 if __name__ == "__main__":
     main()
