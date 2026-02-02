@@ -1,9 +1,29 @@
-import urllib.request, json, base64, re, urllib.parse, datetime, time, difflib
+#!/usr/bin/env python3
+"""
+migrate_java_dynamic_tags_no_assignee.py
 
-# --- CONFIGURATION ---
-BASE_URL = "https://gitlab.company-domain.com/api/v4" 
-TOKEN = "glpat-your-token-here" 
-PROJECT_IDS = [101, 102] # Add all 12 Project IDs here
+Updates:
+- Removes assignee from MR creation.
+- Re-fetches remote file contents from FEATURE_BRANCH immediately before committing,
+  and only commits if there are remaining changes. If a file is absent on the branch,
+  it will be created.
+- Keeps dynamic tag selection, --dry-run, full diffs, and summary modes.
+"""
+
+import urllib.request
+import json
+import base64
+import re
+import urllib.parse
+import datetime
+import difflib
+import argparse
+import sys
+
+# --- CONFIGURATION (edit as needed) ---
+BASE_URL = "https://gitlab.company-domain.com/api/v4"
+TOKEN = "glpat-your-token-here"
+PROJECT_IDS = [101, 102]  # Add all project IDs here or pass --projects
 
 JIRA_ID = "4323"
 UPGRADE_TYPE = "java17-migration"
@@ -12,31 +32,37 @@ SOURCE_BRANCH = "develop"
 MR_TITLE = f"TASK-{JIRA_ID}: java migration"
 
 TARGET_PARENT_VERSION = "1.8.3"
-# Latest recommended platform as of Feb 2026
 NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17 running on 64bit Amazon Linux 2/3.10.3"
-
-TAG_MAPPING = {
-    "1": "dev",
-    "2": "azure-dev",
-    "3": "test",
-    "4": "azure-test"
-}
-
 # ---------------------------------------------------------
 
 def log(msg, level="INFO"):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [{level}] {msg}")
 
-def api_call(endpoint, method="GET", data=None):
+def api_call(endpoint, method="GET", data=None, dry_run=False):
+    """
+    Wrapper for GitLab API calls. When dry_run=True, non-GET calls are logged and not executed.
+    Returns parsed JSON on success, or dict with {"error": True, "details": "..."} on exception.
+    """
     url = f"{BASE_URL}/{endpoint}"
+    if dry_run and method != "GET":
+        log(f"(dry-run) Would call: {method} {url} with data: {json.dumps(data) if data else None}", "DRY")
+        # Provide sensible empty responses to keep control flow working
+        if method == "POST":
+            return {}
+        if method == "DELETE":
+            return {}
+        return {}
     req = urllib.request.Request(url, method=method)
     req.add_header("PRIVATE-TOKEN", TOKEN)
     req.add_header("Content-Type", "application/json")
     body = json.dumps(data).encode("utf-8") if data else None
     try:
         with urllib.request.urlopen(req, data=body) as response:
-            return json.loads(response.read().decode("utf-8"))
+            text = response.read().decode("utf-8")
+            if not text:
+                return {}
+            return json.loads(text)
     except Exception as e:
         return {"error": True, "details": str(e)}
 
@@ -46,24 +72,85 @@ def update_parent_block(match):
     block = re.sub(r"(parent-pom-).*?(\.xml)", rf"\1{TARGET_PARENT_VERSION}\2", block)
     return block
 
-def main():
-    if not PROJECT_IDS: return log("Please add PROJECT_IDS.", "ERROR")
-    
-    choices = input("Select Updates (1:POM, 2:CI, 3:EB): ").replace(" ", "").split(',')
-    do_orch = input("Trigger Tags/Deployment? (y/n): ").lower() == 'y'
+def show_unified_diff(path, old, new):
+    old_lines = old.splitlines(keepends=True)
+    new_lines = new.splitlines(keepends=True)
+    ud = ''.join(difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=f"{path} (new)", lineterm=''))
+    return ud
 
-    for pid in PROJECT_IDS:
+def prompt_yes_no(prompt, default=False):
+    ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    if ans == '':
+        return default
+    return ans in ("y", "yes")
+
+def fetch_tags_for_project(pid, per_page=100):
+    endpoint = f"projects/{pid}/repository/tags?per_page={per_page}"
+    return api_call(endpoint)
+
+def parse_tag_selection_input(selection_str, available_tags):
+    if not selection_str:
+        return []
+    s = selection_str.strip()
+    if s.lower() == "all":
+        return [t['name'] for t in available_tags]
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    chosen = []
+    idx_map = {str(i+1): t['name'] for i, t in enumerate(available_tags)}
+    name_set = {t['name'] for t in available_tags}
+    for p in parts:
+        if p in idx_map:
+            chosen.append(idx_map[p])
+        elif p in name_set:
+            chosen.append(p)
+        else:
+            continue
+    seen = set()
+    result = []
+    for name in chosen:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch Java migration helper for GitLab projects (no MR assignee).")
+    parser.add_argument("--projects", help="Comma-separated project IDs to process (overrides PROJECT_IDS)", default="")
+    parser.add_argument("--full-diff", help="Show full unified diffs (default: True)", action="store_true", default=True)
+    parser.add_argument("--summary-only", help="Show only line-count summary (overrides --full-diff)", action="store_true")
+    parser.add_argument("--dry-run", help="Do not perform write operations (branches, commits, MRs, tags)", action="store_true")
+    args = parser.parse_args()
+
+    dry_run = args.dry_run
+    show_full = args.full_diff and not args.summary_only
+
+    project_ids = PROJECT_IDS
+    if args.projects:
+        try:
+            project_ids = [int(x.strip()) for x in args.projects.split(",") if x.strip()]
+        except Exception:
+            log("Invalid --projects value. Provide comma-separated integers.", "ERROR")
+            sys.exit(1)
+    if not project_ids:
+        log("Please add PROJECT_IDS or pass --projects.", "ERROR")
+        sys.exit(1)
+
+    choices = input("Select Updates (1:POM, 2:CI, 3:EB) e.g. 1,2: ").replace(" ", "").split(',')
+    do_orch = prompt_yes_no("Trigger Tags/Deployment? (y/n)", default=False)
+
+    for pid in project_ids:
         project_info = api_call(f"projects/{pid}")
         p_name = project_info.get('name', f"ID:{pid}")
-        log(f"--- Processing: {p_name} ---")
-        
+        log(f"--- Processing: {p_name} (project id: {pid}) ---")
         actions = []
-        br_check = api_call(f"projects/{pid}/repository/branches/{FEATURE_BRANCH}")
+
+        # Check if feature branch exists; if not we'll use SOURCE_BRANCH as ref for reading files
+        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
         current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
-        
+
         # --- 1. POM Update (11 to 17 Swap) ---
         if '1' in choices:
-            res = api_call(f"projects/{pid}/repository/files/pom.xml?ref={current_ref}")
+            res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
             if "content" in res:
                 orig = base64.b64decode(res['content']).decode('utf-8')
                 upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
@@ -74,7 +161,7 @@ def main():
 
         # --- 2. CI image cleanup ---
         if '2' in choices:
-            res = api_call(f"projects/{pid}/repository/files/.gitlab-ci.yml?ref={current_ref}")
+            res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('.gitlab-ci.yml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
             if "content" in res:
                 orig = base64.b64decode(res['content']).decode('utf-8')
                 upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
@@ -84,54 +171,145 @@ def main():
         # --- 3. EB Config platform update ---
         if '3' in choices:
             path = urllib.parse.quote(".elasticbeanstalk/config.yml", safe='')
-            res = api_call(f"projects/{pid}/repository/files/{path}?ref={current_ref}")
+            res = api_call(f"projects/{pid}/repository/files/{path}?ref={urllib.parse.quote(current_ref, safe='')}")
             if "content" in res:
                 orig = base64.b64decode(res['content']).decode('utf-8')
                 upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
                 if orig != upd:
                     actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd, "old_content": orig})
 
-        # --- PRE-COMMIT DIFF SUMMARY ---
+        # --- PRE-COMMIT DIFF SUMMARY / FULL DIFF ---
         if actions:
-            print(f"📊 Proposed Changes for {p_name}:")
+            print(f"\n📊 Proposed Changes for {p_name}:")
             for action in actions:
-                diff = list(difflib.ndiff(action['old_content'].splitlines(), action['content'].splitlines()))
-                added = len([l for l in diff if l.startswith('+ ')])
-                removed = len([l for l in diff if l.startswith('- ')])
-                print(f"   📄 {action['file_path']} -> [+{added} | -{removed} lines]")
-
-            if input(f"👉 Commit and raise MR for {p_name}? (y/n): ").lower() == 'y':
-                if "name" not in br_check:
-                    api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH})
-                
-                api_call(f"projects/{pid}/repository/commits", "POST", {
-                    "branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": actions
-                })
-
-                existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={FEATURE_BRANCH}")
-                if not existing or len(existing) == 0:
-                    api_call(f"projects/{pid}/merge_requests", "POST", {
-                        "source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, 
-                        "title": MR_TITLE
-                    })
-                    log(f"   ✅ MR raised successfully.")
+                if show_full:
+                    ud = show_unified_diff(action['file_path'], action['old_content'], action['content'])
+                    if ud.strip():
+                        print(f"\n--- Diff for {action['file_path']} ---")
+                        print(ud)
+                        print(f"--- End diff for {action['file_path']} ---\n")
+                    else:
+                        print(f"   📄 {action['file_path']} -> [+0 | -0 lines] (no textual diff)")
                 else:
-                    log(f"   ℹ️ MR already exists: {existing[0]['web_url']}")
+                    diff = list(difflib.ndiff(action['old_content'].splitlines(), action['content'].splitlines()))
+                    added = len([l for l in diff if l.startswith('+ ')])
+                    removed = len([l for l in diff if l.startswith('- ')])
+                    print(f"   📄 {action['file_path']} -> [+{added} | -{removed} lines]")
 
-        # --- TAG ORCHESTRATION ---
+            if prompt_yes_no(f"👉 Commit and raise MR for {p_name}?", default=False):
+                # If feature branch doesn't exist, create it from SOURCE_BRANCH
+                created_branch = False
+                if "name" not in br_check:
+                    log(f"Feature branch {FEATURE_BRANCH} not found. Creating from {SOURCE_BRANCH}...", "INFO")
+                    api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
+                    created_branch = True
+
+                # Re-check the files from the (now-existing) FEATURE_BRANCH to ensure changes are still necessary
+                commit_actions = []
+                for act in actions:
+                    file_path = act['file_path']
+                    quoted_path = urllib.parse.quote(file_path, safe='')
+                    # Try to fetch file content from the feature branch
+                    res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    desired = act['content']
+                    if "content" in res:
+                        remote_content = base64.b64decode(res['content']).decode('utf-8')
+                        if remote_content == desired:
+                            log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
+                            continue
+                        else:
+                            commit_actions.append({
+                                "action": "update",
+                                "file_path": file_path,
+                                "content": desired
+                            })
+                    else:
+                        # file missing or errored; assume create
+                        log(f"{file_path} not found on {FEATURE_BRANCH} (or fetch error). Will attempt to create it.", "INFO")
+                        commit_actions.append({
+                            "action": "create",
+                            "file_path": file_path,
+                            "content": desired
+                        })
+
+                if not commit_actions:
+                    log(f"No remaining changes to commit for {p_name}; skipping commit and MR creation.", "INFO")
+                else:
+                    # POST commit
+                    commit_payload = {
+                        "branch": FEATURE_BRANCH,
+                        "commit_message": f"fix: {UPGRADE_TYPE}",
+                        "actions": commit_actions
+                    }
+                    api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
+                    log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
+
+                    # Create MR if none exists (note: no assignees included)
+                    existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    if not existing or (isinstance(existing, list) and len(existing) == 0) or existing.get("error"):
+                        mr_payload = {
+                            "source_branch": FEATURE_BRANCH,
+                            "target_branch": SOURCE_BRANCH,
+                            "title": MR_TITLE
+                        }
+                        api_call(f"projects/{pid}/merge_requests", "POST", mr_payload, dry_run=dry_run)
+                        log("✅ MR raised." if not dry_run else "✅ (dry-run) MR would be raised.")
+                    else:
+                        try:
+                            existing_url = existing[0].get('web_url', 'unknown')
+                            log(f"ℹ️ MR already exists: {existing_url}")
+                        except Exception:
+                            log("ℹ️ MR already exists (could not parse response).")
+
+        # --- DYNAMIC TAG ORCHESTRATION ---
         if do_orch:
-            print("\n🏷️ Tags: 1:dev, 2:azure-dev, 3:test, 4:azure-test")
-            tag_choices = input(f"Select tags for {p_name} (e.g., 1,2): ").replace(" ", "").split(',')
-            selected_tags = [TAG_MAPPING[t] for t in tag_choices if t in TAG_MAPPING]
-            
-            for tag in selected_tags:
-                exists = api_call(f"projects/{pid}/repository/tags/{tag}")
-                if not exists.get("error"):
-                    api_call(f"projects/{pid}/repository/tags/{tag}", method="DELETE")
-                
-                t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH})
-                if not t_res.get("error"):
-                    log(f"   🚀 Created tag '{tag}' on {FEATURE_BRANCH}")
+            tags_resp = fetch_tags_for_project(pid)
+            if isinstance(tags_resp, dict) and tags_resp.get("error"):
+                log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
+                continue
+
+            available_tags = tags_resp if isinstance(tags_resp, list) else []
+            if not available_tags:
+                log(f"No tags returned for project {p_name}.", "INFO")
+                if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False):
+                    continue
+                new_tag_name = input("Enter tag name to create on feature branch: ").strip()
+                if new_tag_name:
+                    api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": new_tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                    log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}" if not dry_run else f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}")
+                continue
+
+            print(f"\nAvailable tags for {p_name}:")
+            for i, t in enumerate(available_tags):
+                commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
+                print(f"  {i+1:>3}. {t.get('name', '')}  {commit_id}")
+
+            sel = input("Select tags to delete & recreate by index or name (e.g. '1,3' or 'dev,release-1') or 'all' or leave empty to skip: ").strip()
+            selected_tag_names = parse_tag_selection_input(sel, available_tags)
+            if not selected_tag_names:
+                log("No tags selected; skipping tag orchestration for this project.", "INFO")
+            else:
+                print(f"Selected tags: {', '.join(selected_tag_names)}")
+                if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False):
+                    log("Tag orchestration cancelled by user.", "INFO")
+                else:
+                    for tag in selected_tag_names:
+                        quoted_tag = urllib.parse.quote(tag, safe='')
+                        exists_locally = tag in {t['name'] for t in available_tags}
+                        if exists_locally:
+                            log(f"Tag '{tag}' exists and will be deleted.", "INFO")
+                            api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
+                        else:
+                            log(f"Tag '{tag}' does not exist; will be created pointing to {FEATURE_BRANCH}.", "INFO")
+
+                        t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                        if dry_run:
+                            log(f"(dry-run) Would create tag '{tag}' on {FEATURE_BRANCH}", "DRY")
+                        else:
+                            if not isinstance(t_res, dict) or not t_res.get("error"):
+                                log(f"🚀 Created tag '{tag}' on {FEATURE_BRANCH}")
+                            else:
+                                log(f"Failed to create tag '{tag}': {t_res.get('details')}", "ERROR")
 
     log("🏁 Batch processing complete.")
 
