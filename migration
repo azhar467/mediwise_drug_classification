@@ -149,7 +149,17 @@ def main():
         log("Please add PROJECT_IDS or pass --projects.", "ERROR")
         sys.exit(1)
 
-    choices = input("Select updates to run (1:POM, 2:CI, 3:EB), e.g. 1,2: ").replace(" ", "").split(',')
+    raw_choices = input("Select updates to run (1:POM, 2:CI, 3:EB, 4:ALL), e.g. 1,2 or 4: ").replace(" ", "")
+    choices = raw_choices.split(',') if raw_choices else []
+    # If user selected '4' (ALL), expand it to 1,2,3 (preserving other selections)
+    if '4' in choices:
+        # remove all '4' tokens
+        choices = [c for c in choices if c != '4']
+        # ensure 1,2,3 are present (insert at start to preserve ordering where possible)
+        for c in ('3', '2', '1'):
+            if c not in choices:
+                choices.insert(0, c)
+
     do_orch = prompt_yes_no("Trigger tags/deployment? (y/n)", default=False)
 
     for pid in project_ids:
@@ -215,6 +225,9 @@ def main():
                 if "name" not in br_check:
                     log(f"Feature branch {FEATURE_BRANCH} not found. Creating from {SOURCE_BRANCH}...", "INFO")
                     api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
+                    # Refresh branch check and current_ref after attempted creation
+                    br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
 
                 # Re-check the files from the (now-existing) FEATURE_BRANCH to ensure changes are still necessary
                 commit_actions = []
@@ -255,38 +268,67 @@ def main():
                     }
                     api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
                     log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
+        else:
+            log(f"No proposed changes for {p_name}.", "INFO")
 
-                    # MR creation is independent: either skipped by flag, or asked now
-                    if skip_mr:
-                        log("Skip MR flag is set; not creating a merge request.", "INFO")
-                    else:
-                        if prompt_yes_no(f"Create merge request for {p_name} from {FEATURE_BRANCH} into {SOURCE_BRANCH}?", default=True):
-                            existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                            if not existing or (isinstance(existing, list) and len(existing) == 0) or existing.get("error"):
-                                mr_payload = {
-                                    "source_branch": FEATURE_BRANCH,
-                                    "target_branch": SOURCE_BRANCH,
-                                    "title": MR_TITLE
-                                }
-                                api_call(f"projects/{pid}/merge_requests", "POST", mr_payload, dry_run=dry_run)
-                                log("MR created." if not dry_run else "(dry-run) MR would be created.", "INFO")
-                            else:
-                                try:
-                                    existing_url = existing[0].get('web_url', 'unknown')
-                                    log(f"MR already exists: {existing_url}", "INFO")
-                                except Exception:
-                                    log("MR already exists (could not parse response).", "INFO")
+        # --- CENTRALIZED MR CHECK/PROMPT (always runs per-project, unless skip_mr) ---
+        if not skip_mr:
+            try:
+                existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+            except Exception as e:
+                existing = {"error": True, "details": str(e)}
 
-        # --- DYNAMIC TAG ORCHESTRATION ---
+            has_open_mr = False
+            if isinstance(existing, list) and len(existing) > 0:
+                has_open_mr = True
+            elif isinstance(existing, dict) and existing.get("error"):
+                log(f"Could not verify existing MRs for {p_name}: {existing.get('details')}", "ERROR")
+
+            if has_open_mr:
+                try:
+                    existing_url = existing[0].get('web_url', 'unknown')
+                    log(f"MR already exists: {existing_url}", "INFO")
+                except Exception:
+                    log("MR already exists (could not parse response).", "INFO")
+            else:
+                # If feature branch missing, offer to create it before creating MR
+                if "name" not in br_check:
+                    if prompt_yes_no(f"Feature branch {FEATURE_BRANCH} not found. Create it from {SOURCE_BRANCH} so an MR can be opened?", default=False):
+                        api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
+                        br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                        current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
+                        if "name" not in br_check:
+                            log(f"Failed to create or find branch {FEATURE_BRANCH}; cannot create MR.", "ERROR")
+
+                # Only prompt to create MR if branch exists (or was just created)
+                if "name" in br_check:
+                    if prompt_yes_no(f"Create merge request for {p_name} from {FEATURE_BRANCH} into {SOURCE_BRANCH}?", default=True):
+                        mr_payload = {
+                            "source_branch": FEATURE_BRANCH,
+                            "target_branch": SOURCE_BRANCH,
+                            "title": MR_TITLE
+                        }
+                        api_call(f"projects/{pid}/merge_requests", "POST", mr_payload, dry_run=dry_run)
+                        log("MR created." if not dry_run else "(dry-run) MR would be created.", "INFO")
+                else:
+                    log(f"Skipping MR creation because feature branch {FEATURE_BRANCH} does not exist.", "INFO")
+        else:
+            log("Skip MR flag is set; not creating a merge request.", "INFO")
+
+        # --- DYNAMIC TAG ORCHESTRATION (only dev/test tags shown) ---
         if do_orch:
             tags_resp = fetch_tags_for_project(pid)
             if isinstance(tags_resp, dict) and tags_resp.get("error"):
                 log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
                 continue
 
-            available_tags = tags_resp if isinstance(tags_resp, list) else []
+            available_tags_all = tags_resp if isinstance(tags_resp, list) else []
+            # Only show tags containing 'dev' or 'test' (case-insensitive)
+            available_tags = [t for t in available_tags_all if isinstance(t, dict) and ('dev' in (t.get('name','').lower()) or 'test' in (t.get('name','').lower()))]
+
             if not available_tags:
-                log(f"No tags returned for project {p_name}.", "INFO")
+                log(f"No dev/test tags returned for project {p_name}.", "INFO")
+                # Ask if user wants to create a tag even if none exist
                 if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False):
                     continue
                 new_tag_name = input("Enter tag name to create on feature branch: ").strip()
@@ -295,7 +337,7 @@ def main():
                     log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}" if not dry_run else f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}", "INFO")
                 continue
 
-            print(f"\nAvailable tags for {p_name}:")
+            print(f"\nAvailable dev/test tags for {p_name}:")
             for i, t in enumerate(available_tags):
                 commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
                 print(f"  {i+1:>3}. {t.get('name', '')}  {commit_id}")
@@ -311,7 +353,7 @@ def main():
                 else:
                     for tag in selected_tag_names:
                         quoted_tag = urllib.parse.quote(tag, safe='')
-                        exists_locally = tag in {t['name'] for t in available_tags}
+                        exists_locally = tag in {t['name'] for t in available_tags_all}
                         if exists_locally:
                             log(f"Tag '{tag}' exists and will be deleted.", "INFO")
                             api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
