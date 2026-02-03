@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-migrate_java_no_emojis_optional_mr.py
-
-Features:
-- Detects and prepares POM / CI / EB changes (Java 11->17, CI image cleanup, EB platform update).
-- Shows unified diffs (or summary) before committing.
-- Re-reads remote files from feature branch before committing (API-equivalent of git pull).
-- Creates feature branch if missing.
-- Commits only if there are remaining changes.
-- Dynamic tag selection per-project; can delete & recreate selected tags.
-- --dry-run to avoid write operations.
-- --skip-mr to avoid MR creation (MR creation is independent; when not skipped, you'll be prompted after commit).
-- No emojis in logs or prompts.
-"""
-
 import urllib.request
 import json
 import base64
@@ -23,10 +7,16 @@ import datetime
 import difflib
 import argparse
 import sys
+import os
+import pathlib
+import stat
+import textwrap
+import time
+from functools import wraps
 
 # --- CONFIGURATION (edit as needed) ---
 BASE_URL = "https://gitlab.company-domain.com/api/v4"
-TOKEN = "glpat-your-token-here"
+TOKEN = ""  # populated from --token-file or GITLAB_TOKEN env var at runtime
 PROJECT_IDS = [101, 102]  # Add all project IDs here or pass --projects
 
 JIRA_ID = "4323"
@@ -39,16 +29,37 @@ TARGET_PARENT_VERSION = "1.8.3"
 NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17 running on 64bit Amazon Linux 2/3.10.3"
 # ---------------------------------------------------------
 
+
 def log(msg, level="INFO"):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [{level}] {msg}")
 
+
+def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
+    def deco(f):
+        @wraps(f)
+        def wrapper(*a, **kw):
+            _tries, _delay = tries, delay
+            while True:
+                try:
+                    return f(*a, **kw)
+                except allowed_exceptions as e:
+                    _tries -= 1
+                    if _tries <= 0:
+                        raise
+                    time.sleep(_delay)
+                    _delay *= backoff
+        return wrapper
+    return deco
+
+
+@retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,))
 def api_call(endpoint, method="GET", data=None, dry_run=False):
     """
     Wrapper for GitLab API calls. When dry_run=True, non-GET calls are logged and not executed.
     Returns parsed JSON on success, or dict with {"error": True, "details": "..."} on exception.
     """
-    url = f"{BASE_URL}/{endpoint}"
+    url = f"{BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     if dry_run and method != "GET":
         log(f"(dry-run) Would call: {method} {url} with data: {json.dumps(data) if data else None}", "DRY")
         # Provide sensible empty responses to keep control flow working
@@ -58,6 +69,8 @@ def api_call(endpoint, method="GET", data=None, dry_run=False):
             return {}
         return {}
     req = urllib.request.Request(url, method=method)
+    if not TOKEN:
+        raise RuntimeError("API token not set. Provide --token-file or set GITLAB_TOKEN env var.")
     req.add_header("PRIVATE-TOKEN", TOKEN)
     req.add_header("Content-Type", "application/json")
     body = json.dumps(data).encode("utf-8") if data else None
@@ -70,11 +83,13 @@ def api_call(endpoint, method="GET", data=None, dry_run=False):
     except Exception as e:
         return {"error": True, "details": str(e)}
 
+
 def update_parent_block(match):
     block = match.group(0)
     block = re.sub(r"<version>.*?</version>", f"<version>{TARGET_PARENT_VERSION}</version>", block)
     block = re.sub(r"(parent-pom-).*?(\.xml)", rf"\1{TARGET_PARENT_VERSION}\2", block)
     return block
+
 
 def show_unified_diff(path, old, new):
     old_lines = old.splitlines(keepends=True)
@@ -82,15 +97,38 @@ def show_unified_diff(path, old, new):
     ud = ''.join(difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=f"{path} (new)", lineterm=''))
     return ud
 
+
 def prompt_yes_no(prompt, default=False):
-    ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    try:
+        ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    except EOFError:
+        # Non-interactive environment: return default
+        return default
     if ans == '':
         return default
     return ans in ("y", "yes")
 
-def fetch_tags_for_project(pid, per_page=100):
-    endpoint = f"projects/{pid}/repository/tags?per_page={per_page}"
+
+def fetch_tags_for_project(pid, per_page=100, page=1):
+    endpoint = f"projects/{pid}/repository/tags?per_page={per_page}&page={page}"
     return api_call(endpoint)
+
+
+def fetch_all_tags_for_project(pid, per_page=100):
+    page = 1
+    all_tags = []
+    while True:
+        resp = fetch_tags_for_project(pid, per_page=per_page, page=page)
+        if isinstance(resp, dict) and resp.get("error"):
+            return resp
+        if not resp:
+            break
+        all_tags.extend(resp if isinstance(resp, list) else [])
+        if len(resp) < per_page:
+            break
+        page += 1
+    return all_tags
+
 
 def parse_tag_selection_input(selection_str, available_tags):
     """
@@ -125,18 +163,82 @@ def parse_tag_selection_input(selection_str, available_tags):
             result.append(name)
     return result
 
+
+def load_token_from_file(path, require_restrictive_perms=True):
+    """
+    Read a token from `path`. The file should contain the token as plain text.
+    If require_restrictive_perms is True, the function checks that group/other
+    do not have read permissions (mode & 0o077 == 0). If permissions are too
+    open it raises an Exception (safer), but you can relax this behavior if needed.
+    """
+    p = pathlib.Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Token file not found: {p}")
+    if require_restrictive_perms:
+        mode = p.stat().st_mode
+        if mode & 0o077:
+            raise PermissionError(textwrap.dedent(f"""
+                Token file {p} has insecure permissions (mode {oct(mode & 0o777)}).
+                Please restrict it: chmod 600 {p}
+                Alternatively, supply token via GITLAB_TOKEN env var or a different file.
+            """).strip())
+    token = p.read_text(encoding="utf-8").strip()
+    if not token:
+        raise ValueError(f"Token file {p} was empty.")
+    return token
+
+
+def parse_version(vstr):
+    m = re.search(r'(\d+(?:\.\d+)*)', vstr or "")
+    if not m:
+        return ()
+    return tuple(int(x) for x in m.group(1).split('.'))
+
+
+def find_parent_version_in_pom(content):
+    """
+    Naive extractor: look for <parent>...<version>X.Y.Z</version>...</parent>
+    or top-level <parent> sections. Returns first matched version string or None.
+    """
+    m = re.search(r"<parent>[\s\S]*?<version>(.*?)</version>[\s\S]*?</parent>", content, re.I)
+    if m:
+        return m.group(1).strip()
+    # fallback: any <version> tag in file (less reliable)
+    m2 = re.search(r"<version>(.*?)</version>", content, re.I)
+    if m2:
+        return m2.group(1).strip()
+    return None
+
+
 def main():
+    global TOKEN, BASE_URL, PROJECT_IDS
+
     parser = argparse.ArgumentParser(description="Batch Java migration helper for GitLab projects.")
     parser.add_argument("--projects", help="Comma-separated project IDs to process (overrides PROJECT_IDS)", default="")
     parser.add_argument("--full-diff", help="Show full unified diffs (default: True)", action="store_true", default=True)
     parser.add_argument("--summary-only", help="Show only line-count summary (overrides --full-diff)", action="store_true")
     parser.add_argument("--dry-run", help="Do not perform write operations (branches, commits, MRs, tags)", action="store_true")
     parser.add_argument("--skip-mr", help="Do not create merge requests (MR creation will be skipped)", action="store_true")
+    parser.add_argument("--token-file", help="Path to file containing GitLab token (plain text). If omitted, GITLAB_TOKEN env var is used.", default="")
+    parser.add_argument("--no-token-perm-check", help="Do not require restrictive file permissions on token file (less secure).", action="store_true")
     args = parser.parse_args()
 
     dry_run = args.dry_run
     skip_mr = args.skip_mr
     show_full = args.full_diff and not args.summary_only
+
+    # load token
+    if args.token_file:
+        try:
+            TOKEN = load_token_from_file(args.token_file, require_restrictive_perms=not args.no_token_perm_check)
+        except Exception as e:
+            log(f"Failed to load token from file: {e}", "ERROR")
+            sys.exit(1)
+    else:
+        TOKEN = os.getenv("GITLAB_TOKEN", "").strip()
+        if not TOKEN:
+            log("No token supplied: set --token-file PATH or export GITLAB_TOKEN.", "ERROR")
+            sys.exit(1)
 
     project_ids = PROJECT_IDS
     if args.projects:
@@ -151,11 +253,8 @@ def main():
 
     raw_choices = input("Select updates to run (1:POM, 2:CI, 3:EB, 4:ALL), e.g. 1,2 or 4: ").replace(" ", "")
     choices = raw_choices.split(',') if raw_choices else []
-    # If user selected '4' (ALL), expand it to 1,2,3 (preserving other selections)
     if '4' in choices:
-        # remove all '4' tokens
         choices = [c for c in choices if c != '4']
-        # ensure 1,2,3 are present (insert at start to preserve ordering where possible)
         for c in ('3', '2', '1'):
             if c not in choices:
                 choices.insert(0, c)
@@ -168,9 +267,18 @@ def main():
         log(f"--- Processing: {p_name} (project id: {pid}) ---")
         actions = []
 
+        # per-project runtime tracking to avoid touching tags that we just created
+        committed_shas = set()
+        created_tags = set()
+
         # Check if feature branch exists; if not we'll use SOURCE_BRANCH as ref for reading files
         br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
         current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
+
+        # Record branch HEAD now for optimistic locking (if branch exists)
+        branch_head_before = None
+        if isinstance(br_check, dict) and "commit" in br_check:
+            branch_head_before = (br_check.get("commit") or {}).get("id")
 
         # --- 1. POM Update (11 to 17 Swap) ---
         if '1' in choices:
@@ -225,16 +333,17 @@ def main():
                 if "name" not in br_check:
                     log(f"Feature branch {FEATURE_BRANCH} not found. Creating from {SOURCE_BRANCH}...", "INFO")
                     api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
-                    # Refresh branch check and current_ref after attempted creation
+                    # Refresh branch info
                     br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
                     current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
+                    if isinstance(br_check, dict) and "commit" in br_check:
+                        branch_head_before = (br_check.get("commit") or {}).get("id")
 
                 # Re-check the files from the (now-existing) FEATURE_BRANCH to ensure changes are still necessary
                 commit_actions = []
                 for act in actions:
                     file_path = act['file_path']
                     quoted_path = urllib.parse.quote(file_path, safe='')
-                    # Try to fetch file content from the feature branch
                     res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
                     desired = act['content']
                     if "content" in res:
@@ -243,13 +352,22 @@ def main():
                             log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
                             continue
                         else:
+                            # Additional safety for parent version: if remote parent version is higher than desired, prompt
+                            if file_path == "pom.xml":
+                                remote_ver_str = find_parent_version_in_pom(remote_content)
+                                remote_ver = parse_version(remote_ver_str)
+                                desired_ver = parse_version(TARGET_PARENT_VERSION)
+                                if remote_ver and desired_ver and remote_ver > desired_ver:
+                                    log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
+                                    if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False):
+                                        log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
+                                        continue
                             commit_actions.append({
                                 "action": "update",
                                 "file_path": file_path,
                                 "content": desired
                             })
                     else:
-                        # file missing or errored; attempt to create
                         log(f"{file_path} not found on {FEATURE_BRANCH} (or fetch error). Will attempt to create it.", "INFO")
                         commit_actions.append({
                             "action": "create",
@@ -260,14 +378,45 @@ def main():
                 if not commit_actions:
                     log(f"No remaining changes to commit for {p_name}; skipping commit.", "INFO")
                 else:
-                    # POST commit
-                    commit_payload = {
-                        "branch": FEATURE_BRANCH,
-                        "commit_message": f"fix: {UPGRADE_TYPE}",
-                        "actions": commit_actions
-                    }
-                    api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
-                    log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
+                    # Optimistic HEAD-check: re-fetch branch head and ensure it didn't change since we started processing
+                    if branch_head_before:
+                        br_now = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                        branch_head_now = (br_now.get("commit") or {}).get("id") if isinstance(br_now, dict) else None
+                        if branch_head_now and branch_head_now != branch_head_before:
+                            log(f"Branch {FEATURE_BRANCH} head changed from {branch_head_before[:8]} to {branch_head_now[:8]} while running. Aborting commit to avoid overwriting remote changes.", "WARN")
+                            if prompt_yes_no("Branch changed — re-evaluate changes and continue anyway?", default=False):
+                                # update baseline and continue (note: in a stricter flow you might re-run file checks)
+                                branch_head_before = branch_head_now
+                            else:
+                                log("Skipping commit for this project due to branch head change.", "INFO")
+                                # skip commit for this project
+                                commit_actions = []
+                    if commit_actions:
+                        commit_payload = {
+                            "branch": FEATURE_BRANCH,
+                            "commit_message": f"fix: {UPGRADE_TYPE}",
+                            "actions": commit_actions
+                        }
+                        commit_resp = api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
+                        if dry_run:
+                            log("(dry-run) Commit would be sent.", "INFO")
+                        else:
+                            # try to capture created commit SHA(s)
+                            if isinstance(commit_resp, dict) and not commit_resp.get("error"):
+                                # gitlab usually returns a commit object with 'id'
+                                sha = commit_resp.get("id") or (commit_resp.get("commit") or {}).get("id")
+                                if sha:
+                                    committed_shas.add(sha)
+                                    log(f"Recorded new commit {sha[:8]} for project {p_name}.", "INFO")
+                            elif isinstance(commit_resp, list):
+                                for item in commit_resp:
+                                    if isinstance(item, dict):
+                                        sha = item.get("id") or (item.get("commit") or {}).get("id")
+                                        if sha:
+                                            committed_shas.add(sha)
+                            else:
+                                log(f"Commit response: {commit_resp}", "DEBUG")
+                            log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
         else:
             log(f"No proposed changes for {p_name}.", "INFO")
 
@@ -291,16 +440,16 @@ def main():
                 except Exception:
                     log("MR already exists (could not parse response).", "INFO")
             else:
-                # If feature branch missing, offer to create it before creating MR
                 if "name" not in br_check:
                     if prompt_yes_no(f"Feature branch {FEATURE_BRANCH} not found. Create it from {SOURCE_BRANCH} so an MR can be opened?", default=False):
                         api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
                         br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
                         current_ref = FEATURE_BRANCH if "name" in br_check else SOURCE_BRANCH
+                        if isinstance(br_check, dict) and "commit" in br_check:
+                            branch_head_before = (br_check.get("commit") or {}).get("id")
                         if "name" not in br_check:
                             log(f"Failed to create or find branch {FEATURE_BRANCH}; cannot create MR.", "ERROR")
 
-                # Only prompt to create MR if branch exists (or was just created)
                 if "name" in br_check:
                     if prompt_yes_no(f"Create merge request for {p_name} from {FEATURE_BRANCH} into {SOURCE_BRANCH}?", default=True):
                         mr_payload = {
@@ -317,24 +466,35 @@ def main():
 
         # --- DYNAMIC TAG ORCHESTRATION (only dev/test tags shown) ---
         if do_orch:
-            tags_resp = fetch_tags_for_project(pid)
+            tags_resp = fetch_all_tags_for_project(pid)
             if isinstance(tags_resp, dict) and tags_resp.get("error"):
                 log(f"Could not fetch tags for project {p_name}: {tags_resp.get('details')}", "ERROR")
                 continue
 
             available_tags_all = tags_resp if isinstance(tags_resp, list) else []
-            # Only show tags containing 'dev' or 'test' (case-insensitive)
+            # Keep tags whose name contains 'dev' or 'test' (case-insensitive)
             available_tags = [t for t in available_tags_all if isinstance(t, dict) and ('dev' in (t.get('name','').lower()) or 'test' in (t.get('name','').lower()))]
 
             if not available_tags:
                 log(f"No dev/test tags returned for project {p_name}.", "INFO")
-                # Ask if user wants to create a tag even if none exist
                 if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False):
                     continue
                 new_tag_name = input("Enter tag name to create on feature branch: ").strip()
                 if new_tag_name:
-                    api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": new_tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
-                    log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}" if not dry_run else f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}", "INFO")
+                    # If we create a tag here, ensure we record it
+                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": new_tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                    if dry_run:
+                        log(f"(dry-run) Would create tag '{new_tag_name}' on {FEATURE_BRANCH}", "DRY")
+                    else:
+                        if not isinstance(t_res, dict) or not t_res.get("error"):
+                            created_tags.add(new_tag_name)
+                            # record commit id if provided
+                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                            if created_tag_commit:
+                                committed_shas.add(created_tag_commit)
+                            log(f"Created tag '{new_tag_name}' on {FEATURE_BRANCH}", "INFO")
+                        else:
+                            log(f"Failed to create tag '{new_tag_name}': {t_res.get('details')}", "ERROR")
                 continue
 
             print(f"\nAvailable dev/test tags for {p_name}:")
@@ -351,25 +511,55 @@ def main():
                 if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False):
                     log("Tag orchestration cancelled by user.", "INFO")
                 else:
+                    # Determine feature-branch head to compare when creating tags
+                    branch_info_for_tag = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    feature_head = None
+                    if isinstance(branch_info_for_tag, dict) and not branch_info_for_tag.get("error"):
+                        feature_head = (branch_info_for_tag.get("commit") or {}).get("id")
+
                     for tag in selected_tag_names:
                         quoted_tag = urllib.parse.quote(tag, safe='')
-                        exists_locally = tag in {t['name'] for t in available_tags_all}
-                        if exists_locally:
-                            log(f"Tag '{tag}' exists and will be deleted.", "INFO")
-                            api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
-                        else:
-                            log(f"Tag '{tag}' does not exist; will be created pointing to {FEATURE_BRANCH}.", "INFO")
 
+                        # find tag object (if it exists) in the full tag list
+                        tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag), None)
+                        tag_commit_id = (tag_obj.get('commit') or {}).get('id') if tag_obj else None
+
+                        # 1) If tag already points to a commit that we created this run, skip it
+                        if tag_commit_id and tag_commit_id in committed_shas:
+                            log(f"Skipping tag '{tag}': it already points to a commit created in this run ({tag_commit_id[:8]}).", "INFO")
+                            continue
+
+                        # 2) If tag was created earlier in this run, skip (avoid recreate/delete churn)
+                        if tag in created_tags:
+                            log(f"Skipping tag '{tag}': it was created earlier in this run.", "INFO")
+                            continue
+
+                        # 3) If tag already exists and already points to the desired ref (feature branch head), nothing to do
+                        if tag_commit_id and feature_head and tag_commit_id == feature_head:
+                            log(f"Skipping tag '{tag}': already points to feature branch head {feature_head[:8]}.", "INFO")
+                            continue
+
+                        exists_locally = tag_obj is not None
+                        if exists_locally:
+                            log(f"Tag '{tag}' exists and will be deleted (unless skipped by rules above).", "INFO")
+                            api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
+
+                        # create tag pointing to FEATURE_BRANCH (or other chosen ref)
                         t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
                         if dry_run:
                             log(f"(dry-run) Would create tag '{tag}' on {FEATURE_BRANCH}", "DRY")
                         else:
                             if not isinstance(t_res, dict) or not t_res.get("error"):
                                 log(f"Created tag '{tag}' on {FEATURE_BRANCH}", "INFO")
+                                created_tags.add(tag)
+                                created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                                if created_tag_commit:
+                                    committed_shas.add(created_tag_commit)
                             else:
                                 log(f"Failed to create tag '{tag}': {t_res.get('details')}", "ERROR")
 
     log("Batch processing complete.", "INFO")
+
 
 if __name__ == "__main__":
     main()
