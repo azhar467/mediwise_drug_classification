@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-Batch Java migration helper for GitLab projects.
-
-Modifications:
-- Token is provided directly with --token (or by editing the TOKEN constant).
-- Client-side batching: --batch-size and --batch-delay.
-- api_call raises on transient HTTP errors (429 and 5xx) so the retry() decorator can back off and retry.
-- Encapsulated per-project processing and batch runner.
-- Fixed regex replacement ambiguity (avoids "invalid group reference" errors).
-
-Usage:
-  python3 mediwise_batch_migration.py --token "GLAB_..." --batch-size 3 --batch-delay 30
-"""
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -23,11 +9,12 @@ import difflib
 import argparse
 import sys
 import time
+import os
 from functools import wraps
 
 # --- CONFIGURATION (edit as needed) ---
 BASE_URL = "https://gitlab.company-domain.com/api/v4"
-TOKEN = ""  # You may also set the token here directly as a string.
+TOKEN = ""  # Will be loaded from .env or token.txt file
 PROJECT_IDS = [101, 102]  # Add all project IDs here or pass --projects
 
 JIRA_ID = "4323"
@@ -44,6 +31,61 @@ NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17
 def log(msg, level="INFO"):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [{level}] {msg}")
+
+
+def load_token_from_file():
+    """
+    Load GitLab token from .env or token.txt file in the script's directory.
+    
+    Priority:
+    1. .env file (looks for GITLAB_TOKEN=xxx or TOKEN=xxx)
+    2. token.txt file (reads entire content as token)
+    
+    Returns the token string or None if not found.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Try .env file first
+    env_file = os.path.join(script_dir, '.env')
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if not line or line.startswith('#'):
+                        continue
+                    # Look for GITLAB_TOKEN or TOKEN
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # Remove quotes if present
+                        if value.startswith('"') and value.endswith('"'):
+                            value = value[1:-1]
+                        elif value.startswith("'") and value.endswith("'"):
+                            value = value[1:-1]
+                        
+                        if key in ('GITLAB_TOKEN', 'TOKEN'):
+                            log(f"Token loaded from .env file (key: {key})", "INFO")
+                            return value
+        except Exception as e:
+            log(f"Error reading .env file: {e}", "WARN")
+    
+    # Try token.txt file
+    token_file = os.path.join(script_dir, 'token.txt')
+    if os.path.exists(token_file):
+        try:
+            with open(token_file, 'r') as f:
+                token = f.read().strip()
+                if token:
+                    log("Token loaded from token.txt file", "INFO")
+                    return token
+        except Exception as e:
+            log(f"Error reading token.txt file: {e}", "WARN")
+    
+    return None
+
 
 
 def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
@@ -207,6 +249,189 @@ def find_parent_version_in_pom(content):
     return None
 
 
+def detect_conflicts(pid, file_path, base_content, our_content, remote_ref):
+    """
+    Detect if there are conflicts between our changes and remote changes.
+    
+    Returns:
+        - None if no conflict detected
+        - dict with conflict info if conflict detected
+    """
+    quoted_path = urllib.parse.quote(file_path, safe='')
+    remote_res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(remote_ref, safe='')}")
+    
+    if isinstance(remote_res, dict) and remote_res.get("error"):
+        # File might not exist on remote, which is not a conflict
+        return None
+    
+    if "content" not in remote_res:
+        return None
+    
+    remote_content = base64.b64decode(remote_res['content']).decode('utf-8')
+    
+    # If remote content equals base content, no remote changes occurred
+    if remote_content == base_content:
+        return None
+    
+    # If remote content equals our desired content, no conflict (already applied)
+    if remote_content == our_content:
+        log(f"Remote {file_path} already contains our changes.", "INFO")
+        return {"type": "already_applied", "file": file_path}
+    
+    # Check if we can do a three-way merge
+    base_lines = base_content.splitlines(keepends=True)
+    our_lines = our_content.splitlines(keepends=True)
+    remote_lines = remote_content.splitlines(keepends=True)
+    
+    # Try to detect if changes overlap
+    our_diff = list(difflib.unified_diff(base_lines, our_lines, lineterm=''))
+    remote_diff = list(difflib.unified_diff(base_lines, remote_lines, lineterm=''))
+    
+    # Extract changed line numbers
+    our_changed_lines = extract_changed_line_numbers(our_diff)
+    remote_changed_lines = extract_changed_line_numbers(remote_diff)
+    
+    # Check for overlapping changes
+    overlap = our_changed_lines.intersection(remote_changed_lines)
+    
+    if overlap:
+        return {
+            "type": "conflict",
+            "file": file_path,
+            "base_content": base_content,
+            "our_content": our_content,
+            "remote_content": remote_content,
+            "overlapping_lines": sorted(overlap)
+        }
+    else:
+        # Changes don't overlap, might be safe to merge
+        return {
+            "type": "non_overlapping",
+            "file": file_path,
+            "base_content": base_content,
+            "our_content": our_content,
+            "remote_content": remote_content
+        }
+
+
+def extract_changed_line_numbers(unified_diff):
+    """Extract line numbers that were changed from a unified diff."""
+    changed_lines = set()
+    current_line = 0
+    
+    for line in unified_diff:
+        if line.startswith('@@'):
+            # Parse line number from hunk header
+            match = re.search(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@', line)
+            if match:
+                current_line = int(match.group(1))
+        elif line.startswith('-'):
+            changed_lines.add(current_line)
+            current_line += 1
+        elif line.startswith('+'):
+            changed_lines.add(current_line)
+        elif line.startswith(' '):
+            current_line += 1
+    
+    return changed_lines
+
+
+def attempt_three_way_merge(base_content, our_content, remote_content):
+    """
+    Attempt a simple three-way merge.
+    Returns merged content if successful, None if conflicts exist.
+    """
+    import difflib
+    
+    base_lines = base_content.splitlines(keepends=True)
+    our_lines = our_content.splitlines(keepends=True)
+    remote_lines = remote_content.splitlines(keepends=True)
+    
+    # Use difflib to generate a merge
+    # This is a simplified approach; a real implementation would use proper 3-way merge
+    our_diff = list(difflib.unified_diff(base_lines, our_lines, lineterm=''))
+    remote_diff = list(difflib.unified_diff(base_lines, remote_lines, lineterm=''))
+    
+    # For simplicity, if both diffs exist and are different, we have a potential conflict
+    # A real implementation would apply patches sequentially
+    
+    # Try applying our changes to remote content
+    if remote_content == base_content:
+        return our_content
+    
+    if our_content == base_content:
+        return remote_content
+    
+    # Both changed - return None to indicate manual resolution needed
+    return None
+
+
+def handle_conflict(conflict_info, pid, p_name):
+    """
+    Handle detected conflicts by presenting options to the user.
+    
+    Returns:
+        - "skip": skip this file
+        - "ours": use our version
+        - "theirs": use remote version  
+        - "manual": user will manually merge
+        - content string: merged content to use
+    """
+    file_path = conflict_info['file']
+    
+    if conflict_info['type'] == 'already_applied':
+        log(f"File {file_path} already has our changes on remote. Skipping.", "INFO")
+        return "skip"
+    
+    if conflict_info['type'] == 'non_overlapping':
+        log(f"File {file_path} has non-overlapping changes. Attempting automatic merge...", "INFO")
+        merged = attempt_three_way_merge(
+            conflict_info['base_content'],
+            conflict_info['our_content'],
+            conflict_info['remote_content']
+        )
+        if merged:
+            log(f"Successfully merged {file_path}.", "INFO")
+            return merged
+        else:
+            log(f"Automatic merge failed for {file_path}.", "WARN")
+    
+    if conflict_info['type'] == 'conflict':
+        print(f"\n{'='*80}")
+        print(f"CONFLICT DETECTED in {file_path}")
+        print(f"{'='*80}")
+        print(f"Remote branch has changes that conflict with your local changes.")
+        print(f"Overlapping line numbers: {conflict_info.get('overlapping_lines', 'unknown')}")
+        print(f"\n--- OUR CHANGES ---")
+        print(show_unified_diff(file_path, conflict_info['base_content'], conflict_info['our_content']))
+        print(f"\n--- REMOTE CHANGES ---")
+        print(show_unified_diff(file_path, conflict_info['base_content'], conflict_info['remote_content']))
+        print(f"{'='*80}\n")
+    
+    print(f"\nConflict resolution options for {file_path}:")
+    print("  1. Use our version (overwrite remote changes)")
+    print("  2. Use remote version (discard our changes)")
+    print("  3. Skip this file")
+    print("  4. Abort entire operation")
+    
+    while True:
+        choice = input("Choose [1/2/3/4]: ").strip()
+        if choice == '1':
+            log(f"Using our version for {file_path}", "INFO")
+            return "ours"
+        elif choice == '2':
+            log(f"Using remote version for {file_path}", "INFO")
+            return "theirs"
+        elif choice == '3':
+            log(f"Skipping {file_path}", "INFO")
+            return "skip"
+        elif choice == '4':
+            log(f"Aborting operation for project {p_name}", "WARN")
+            raise Exception("User aborted due to conflict")
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+
+
 def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None):
     project_info = api_call(f"projects/{pid}")
     p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
@@ -223,6 +448,9 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
     if isinstance(br_check, dict) and "commit" in br_check:
         branch_head_before = (br_check.get("commit") or {}).get("id")
 
+    # Store original content for conflict detection
+    original_contents = {}
+
     # 1. POM
     if choices and '1' in choices:
         res = api_call(f"projects/{pid}/repository/files/{urllib.parse.quote('pom.xml', safe='')}?ref={urllib.parse.quote(current_ref, safe='')}")
@@ -230,6 +458,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
             log(f"Failed to fetch pom.xml for {p_name}: {res.get('details')}", "ERROR")
         elif "content" in res:
             orig = base64.b64decode(res['content']).decode('utf-8')
+            original_contents['pom.xml'] = orig
             upd = re.sub(r"<(java\.version|maven\.compiler\.(source|target|release))>11</\1>", r"<\1>17</\1>", orig)
             if "<parent>" in upd:
                 upd = re.sub(r"<parent>[\s\S]*?</parent>", update_parent_block, upd)
@@ -243,6 +472,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
             log(f"Failed to fetch .gitlab-ci.yml for {p_name}: {res.get('details')}", "ERROR")
         elif "content" in res:
             orig = base64.b64decode(res['content']).decode('utf-8')
+            original_contents['.gitlab-ci.yml'] = orig
             upd = re.sub(r"^\s*image:.*(\n|$)", "", orig, flags=re.MULTILINE)
             if orig != upd:
                 actions.append({"action": "update", "file_path": ".gitlab-ci.yml", "content": upd, "old_content": orig})
@@ -255,6 +485,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
             log(f"Failed to fetch .elasticbeanstalk/config.yml for {p_name}: {res.get('details')}", "ERROR")
         elif "content" in res:
             orig = base64.b64decode(res['content']).decode('utf-8')
+            original_contents['.elasticbeanstalk/config.yml'] = orig
             upd = re.sub(r"(default_platform:\s*).*$", f"default_platform: {NEW_DEFAULT_PLATFORM}", orig, flags=re.MULTILINE)
             if orig != upd:
                 actions.append({"action": "update", "file_path": ".elasticbeanstalk/config.yml", "content": upd, "old_content": orig})
@@ -285,68 +516,113 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                 if isinstance(br_check, dict) and "commit" in br_check:
                     branch_head_before = (br_check.get("commit") or {}).get("id")
 
-            commit_actions = []
+            # **CONFLICT DETECTION** - Check for conflicts before proceeding
+            log(f"Checking for conflicts on {FEATURE_BRANCH}...", "INFO")
+            conflicts_detected = []
+            
             for act in actions:
                 file_path = act['file_path']
-                quoted_path = urllib.parse.quote(file_path, safe='')
-                res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                desired = act['content']
-                if isinstance(res, dict) and res.get("error"):
-                    log(f"Error fetching {file_path} on {FEATURE_BRANCH}: {res.get('details')}", "WARN")
-                    commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
-                elif "content" in res:
-                    remote_content = base64.b64decode(res['content']).decode('utf-8')
-                    if remote_content == desired:
-                        log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
-                        continue
-                    else:
-                        if file_path == "pom.xml":
-                            remote_ver_str = find_parent_version_in_pom(remote_content)
-                            remote_ver = parse_version(remote_ver_str)
-                            desired_ver = parse_version(TARGET_PARENT_VERSION)
-                            if remote_ver and desired_ver and remote_ver > desired_ver:
-                                log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
-                                if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False):
-                                    log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
-                                    continue
-                        commit_actions.append({"action": "update", "file_path": file_path, "content": desired})
-                else:
-                    log(f"{file_path} not found on {FEATURE_BRANCH} (or fetch error). Will attempt to create it.", "INFO")
-                    commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
-
-            if not commit_actions:
-                log(f"No remaining changes to commit for {p_name}; skipping commit.", "INFO")
+                base_content = act['old_content']
+                our_content = act['content']
+                
+                conflict = detect_conflicts(pid, file_path, base_content, our_content, FEATURE_BRANCH)
+                if conflict:
+                    conflicts_detected.append((act, conflict))
+            
+            if conflicts_detected:
+                log(f"Found {len(conflicts_detected)} file(s) with potential conflicts.", "WARN")
+                
+                # Handle each conflict
+                for act, conflict in conflicts_detected:
+                    try:
+                        resolution = handle_conflict(conflict, pid, p_name)
+                        
+                        if resolution == "skip":
+                            # Remove this action from the list
+                            actions = [a for a in actions if a['file_path'] != act['file_path']]
+                        elif resolution == "ours":
+                            # Keep our version (no change to actions)
+                            pass
+                        elif resolution == "theirs":
+                            # Remove this action (we'll keep remote version)
+                            actions = [a for a in actions if a['file_path'] != act['file_path']]
+                        elif isinstance(resolution, str) and resolution not in ["skip", "ours", "theirs"]:
+                            # User provided merged content
+                            for a in actions:
+                                if a['file_path'] == act['file_path']:
+                                    a['content'] = resolution
+                                    break
+                    except Exception as e:
+                        log(f"Conflict handling aborted: {e}", "ERROR")
+                        return
             else:
-                if branch_head_before:
-                    br_now = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
-                    branch_head_now = (br_now.get("commit") or {}).get("id") if isinstance(br_now, dict) else None
-                    if branch_head_now and branch_head_now != branch_head_before:
-                        log(f"Branch {FEATURE_BRANCH} head changed from {branch_head_before[:8]} to {branch_head_now[:8]} while running. Aborting commit to avoid overwriting remote changes.", "WARN")
-                        if prompt_yes_no("Branch changed — re-evaluate changes and continue anyway?", default=False):
-                            branch_head_before = branch_head_now
+                log("No conflicts detected.", "INFO")
+
+            if not actions:
+                log(f"No remaining changes to commit for {p_name} after conflict resolution.", "INFO")
+            else:
+                commit_actions = []
+                for act in actions:
+                    file_path = act['file_path']
+                    quoted_path = urllib.parse.quote(file_path, safe='')
+                    res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                    desired = act['content']
+                    if isinstance(res, dict) and res.get("error"):
+                        log(f"Error fetching {file_path} on {FEATURE_BRANCH}: {res.get('details')}", "WARN")
+                        commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
+                    elif "content" in res:
+                        remote_content = base64.b64decode(res['content']).decode('utf-8')
+                        if remote_content == desired:
+                            log(f"Skipping {file_path}: remote already matches desired content.", "INFO")
+                            continue
                         else:
-                            log("Skipping commit for this project due to branch head change.", "INFO")
-                            commit_actions = []
-                if commit_actions:
-                    commit_payload = {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": commit_actions}
-                    commit_resp = api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
-                    if dry_run:
-                        log("(dry-run) Commit would be sent.", "INFO")
+                            if file_path == "pom.xml":
+                                remote_ver_str = find_parent_version_in_pom(remote_content)
+                                remote_ver = parse_version(remote_ver_str)
+                                desired_ver = parse_version(TARGET_PARENT_VERSION)
+                                if remote_ver and desired_ver and remote_ver > desired_ver:
+                                    log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
+                                    if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False):
+                                        log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
+                                        continue
+                            commit_actions.append({"action": "update", "file_path": file_path, "content": desired})
                     else:
-                        if isinstance(commit_resp, dict) and not commit_resp.get("error"):
-                            sha = commit_resp.get("id") or (commit_resp.get("commit") or {}).get("id")
-                            if sha:
-                                committed_shas.add(sha)
-                                log(f"Recorded new commit {sha[:8]} for project {p_name}.", "INFO")
-                        elif isinstance(commit_resp, list):
-                            for item in commit_resp:
-                                if isinstance(item, dict):
-                                    sha = item.get("id") or (item.get("commit") or {}).get("id")
-                                    if sha:
-                                        committed_shas.add(sha)
+                        log(f"{file_path} not found on {FEATURE_BRANCH} (or fetch error). Will attempt to create it.", "INFO")
+                        commit_actions.append({"action": "create", "file_path": file_path, "content": desired})
+
+                if not commit_actions:
+                    log(f"No remaining changes to commit for {p_name}; skipping commit.", "INFO")
+                else:
+                    if branch_head_before:
+                        br_now = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
+                        branch_head_now = (br_now.get("commit") or {}).get("id") if isinstance(br_now, dict) else None
+                        if branch_head_now and branch_head_now != branch_head_before:
+                            log(f"Branch {FEATURE_BRANCH} head changed from {branch_head_before[:8]} to {branch_head_now[:8]} while running. Aborting commit to avoid overwriting remote changes.", "WARN")
+                            if prompt_yes_no("Branch changed — re-evaluate changes and continue anyway?", default=False):
+                                branch_head_before = branch_head_now
+                            else:
+                                log("Skipping commit for this project due to branch head change.", "INFO")
+                                commit_actions = []
+                    if commit_actions:
+                        commit_payload = {"branch": FEATURE_BRANCH, "commit_message": f"fix: {UPGRADE_TYPE}", "actions": commit_actions}
+                        commit_resp = api_call(f"projects/{pid}/repository/commits", "POST", commit_payload, dry_run=dry_run)
+                        if dry_run:
+                            log("(dry-run) Commit would be sent.", "INFO")
                         else:
-                            log(f"Commit response: {commit_resp}", "DEBUG")
-                        log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
+                            if isinstance(commit_resp, dict) and not commit_resp.get("error"):
+                                sha = commit_resp.get("id") or (commit_resp.get("commit") or {}).get("id")
+                                if sha:
+                                    committed_shas.add(sha)
+                                    log(f"Recorded new commit {sha[:8]} for project {p_name}.", "INFO")
+                            elif isinstance(commit_resp, list):
+                                for item in commit_resp:
+                                    if isinstance(item, dict):
+                                        sha = item.get("id") or (item.get("commit") or {}).get("id")
+                                        if sha:
+                                            committed_shas.add(sha)
+                            else:
+                                log(f"Commit response: {commit_resp}", "DEBUG")
+                            log("Commit request sent." if not dry_run else "(dry-run) Commit would be sent.", "INFO")
     else:
         log(f"No proposed changes for {p_name}.", "INFO")
 
@@ -501,19 +777,36 @@ def main():
     parser.add_argument("--skip-mr", help="Do not create merge requests (MR creation will be skipped)", action="store_true")
     parser.add_argument("--batch-size", type=int, default=3, help="Number of projects to process per batch (default: 3)")
     parser.add_argument("--batch-delay", type=int, default=30, help="Seconds to sleep between batches (default: 30)")
-    parser.add_argument("--token", help="GitLab private token string (you can also edit TOKEN in the script)", default="")
+    parser.add_argument("--token", help="GitLab private token string (overrides file-based tokens)", default="")
     args = parser.parse_args()
 
     dry_run = args.dry_run
     skip_mr = args.skip_mr
     show_full = args.full_diff and not args.summary_only
 
-    # Token must be provided either via --token or by editing TOKEN constant
+    # Token loading priority:
+    # 1. Command line argument (--token)
+    # 2. .env file (GITLAB_TOKEN or TOKEN)
+    # 3. token.txt file
+    # 4. TOKEN constant in script (if set)
+    
     if args.token:
         TOKEN = args.token.strip()
+        log("Using token from command line argument", "INFO")
+    elif not TOKEN:
+        # Try to load from file
+        file_token = load_token_from_file()
+        if file_token:
+            TOKEN = file_token
+        else:
+            log("No token found in .env or token.txt files", "WARN")
 
     if not TOKEN:
-        log("No token supplied: pass --token or set TOKEN in the script.", "ERROR")
+        log("No token supplied. Please provide token via:", "ERROR")
+        log("  1. --token command line argument", "ERROR")
+        log("  2. .env file (GITLAB_TOKEN=your_token)", "ERROR")
+        log("  3. token.txt file in script directory", "ERROR")
+        log("  4. Edit TOKEN constant in the script", "ERROR")
         sys.exit(1)
 
     project_ids = PROJECT_IDS
