@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+Batch Java migration helper for GitLab projects.
+
+Modifications:
+- Token is provided directly with --token (or by editing the TOKEN constant).
+- Client-side batching: --batch-size and --batch-delay.
+- api_call raises on transient HTTP errors (429 and 5xx) so the retry() decorator can back off and retry.
+- Encapsulated per-project processing and batch runner.
+- Fixed regex replacement ambiguity (avoids "invalid group reference" errors).
+- **NEW: Conflict detection before committing changes**
+
+Usage:
+  python3 mediwise_batch_migration.py --token "GLAB_..." --batch-size 3 --batch-delay 30
+"""
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -33,7 +48,7 @@ def log(msg, level="INFO"):
     print(f"[{timestamp}] [{level}] {msg}")
 
 
-def load_token_from_file():
+def load_token_from_file(debug=False):
     """
     Load GitLab token from .env or token.txt file in the script's directory.
     
@@ -45,13 +60,34 @@ def load_token_from_file():
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
+    if debug:
+        log(f"Script directory: {script_dir}", "DEBUG")
+    
     # Try .env file first
     env_file = os.path.join(script_dir, '.env')
+    if debug:
+        log(f"Looking for .env file at: {env_file}", "DEBUG")
+        log(f".env file exists: {os.path.exists(env_file)}", "DEBUG")
+    
     if os.path.exists(env_file):
         try:
             with open(env_file, 'r') as f:
-                for line in f:
+                lines = f.readlines()
+                if debug:
+                    log(f"Read {len(lines)} lines from .env file", "DEBUG")
+                
+                for i, line in enumerate(lines, 1):
+                    original_line = line
                     line = line.strip()
+                    
+                    if debug and line:
+                        # Show line without revealing token value
+                        if '=' in line and not line.startswith('#'):
+                            key = line.split('=', 1)[0].strip()
+                            log(f"Line {i}: key='{key}'", "DEBUG")
+                        else:
+                            log(f"Line {i}: {line[:30]}...", "DEBUG")
+                    
                     # Skip comments and empty lines
                     if not line or line.startswith('#'):
                         continue
@@ -60,6 +96,10 @@ def load_token_from_file():
                         key, value = line.split('=', 1)
                         key = key.strip()
                         value = value.strip()
+                        
+                        if debug:
+                            log(f"Found key: '{key}', value length: {len(value)}", "DEBUG")
+                        
                         # Remove quotes if present
                         if value.startswith('"') and value.endswith('"'):
                             value = value[1:-1]
@@ -68,23 +108,8 @@ def load_token_from_file():
                         
                         if key in ('GITLAB_TOKEN', 'TOKEN'):
                             log(f"Token loaded from .env file (key: {key})", "INFO")
-                            return value
-        except Exception as e:
-            log(f"Error reading .env file: {e}", "WARN")
-    
-    # Try token.txt file
-    token_file = os.path.join(script_dir, 'token.txt')
-    if os.path.exists(token_file):
-        try:
-            with open(token_file, 'r') as f:
-                token = f.read().strip()
-                if token:
-                    log("Token loaded from token.txt file", "INFO")
-                    return token
-        except Exception as e:
-            log(f"Error reading token.txt file: {e}", "WARN")
-    
-    return None
+                            if debug:
+                                log(f"Token length
 
 
 
@@ -203,7 +228,71 @@ def fetch_all_tags_for_project(pid, per_page=100):
         if len(resp) < per_page:
             break
         page += 1
+    
+    # Check for protected tags
+    for tag in all_tags:
+        if isinstance(tag, dict) and tag.get('protected'):
+            tag_name = tag.get('name', 'unknown')
+            log(f"Tag '{tag_name}' is PROTECTED", "WARN")
+    
     return all_tags
+
+
+def filter_and_sort_deployment_tags(tags):
+    """
+    Filter tags to only include deployment-related tags (dev, test, performance variants)
+    and sort them in deployment order.
+    
+    Priority order:
+    1. dev, azure-dev
+    2. test, azure-test
+    3. performance, azure-performance
+    
+    Returns a dict with:
+    - 'sorted_tags': list of tags in priority order
+    - 'found_categories': dict showing which tag types were found
+    - 'missing_categories': list of missing standard tags
+    """
+    if isinstance(tags, dict) and tags.get("error"):
+        return {"error": True, "details": tags.get("details")}
+    
+    tag_list = tags if isinstance(tags, list) else []
+    
+    # Define tag categories and their priority
+    tag_categories = {
+        'dev': {'priority': 1, 'variants': ['dev', 'azure-dev'], 'found': []},
+        'test': {'priority': 2, 'variants': ['test', 'azure-test'], 'found': []},
+        'performance': {'priority': 3, 'variants': ['performance', 'azure-performance'], 'found': []}
+    }
+    
+    # Categorize tags
+    for tag in tag_list:
+        if not isinstance(tag, dict):
+            continue
+        tag_name = tag.get('name', '').lower()
+        
+        for category, info in tag_categories.items():
+            if tag_name in info['variants']:
+                info['found'].append(tag)
+                break
+    
+    # Build sorted list
+    sorted_tags = []
+    found_categories = {}
+    missing_categories = []
+    
+    for category, info in sorted(tag_categories.items(), key=lambda x: x[1]['priority']):
+        if info['found']:
+            sorted_tags.extend(info['found'])
+            found_categories[category] = [t.get('name') for t in info['found']]
+        else:
+            missing_categories.append(category)
+    
+    return {
+        'sorted_tags': sorted_tags,
+        'found_categories': found_categories,
+        'missing_categories': missing_categories
+    }
 
 
 def parse_tag_selection_input(selection_str, available_tags):
@@ -673,10 +762,30 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
             return
 
         available_tags_all = tags_resp if isinstance(tags_resp, list) else []
-        available_tags = [t for t in available_tags_all if isinstance(t, dict) and ('dev' in (t.get('name','').lower()) or 'test' in (t.get('name','').lower()))]
-
+        
+        # Filter and sort deployment tags
+        filter_result = filter_and_sort_deployment_tags(available_tags_all)
+        
+        if isinstance(filter_result, dict) and filter_result.get("error"):
+            log(f"Error filtering tags: {filter_result.get('details')}", "ERROR")
+            return
+        
+        available_tags = filter_result['sorted_tags']
+        found_categories = filter_result['found_categories']
+        missing_categories = filter_result['missing_categories']
+        
+        # Log what was found
+        log(f"Deployment tags found for {p_name}:", "INFO")
+        for category, tag_names in found_categories.items():
+            log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
+        
+        # Log missing tags
+        if missing_categories:
+            for category in missing_categories:
+                log(f"  {category.upper()}: NOT FOUND", "WARN")
+        
         if not available_tags:
-            log(f"No dev/test tags returned for project {p_name}.", "INFO")
+            log(f"No deployment tags (dev/test/performance) found for project {p_name}.", "WARN")
             if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False):
                 return
             new_tag_name = input("Enter tag name to create on feature branch: ").strip()
@@ -695,17 +804,38 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                         log(f"Failed to create tag '{new_tag_name}': {t_res.get('details')}", "ERROR")
             return
 
-        print(f"\nAvailable dev/test tags for {p_name}:")
+        print(f"\nAvailable deployment tags for {p_name} (sorted by deployment order):")
         for i, t in enumerate(available_tags):
             commit_id = (t.get('commit') or {}).get('id', '') if isinstance(t, dict) else ''
-            print(f"  {i+1:>3}. {t.get('name', '')}  {commit_id}")
+            protected_marker = " [PROTECTED]" if t.get('protected') else ""
+            print(f"  {i+1:>3}. {t.get('name', '')}{protected_marker}  {commit_id[:8] if commit_id else ''}")
 
-        sel = input("Select tags to delete & recreate by index or name (e.g. '1,3' or 'dev,release-1') or 'all' or leave empty to skip: ").strip()
+        sel = input("Select tags to delete & recreate by index or name (e.g. '1,3' or 'dev,test') or 'all' or leave empty to skip: ").strip()
         selected_tag_names = parse_tag_selection_input(sel, available_tags)
         if not selected_tag_names:
             log("No tags selected; skipping tag orchestration for this project.", "INFO")
         else:
             print(f"Selected tags: {', '.join(selected_tag_names)}")
+            
+            # Check if any selected tags are protected
+            protected_tags = []
+            for tag_name in selected_tag_names:
+                tag_obj = next((t for t in available_tags_all if isinstance(t, dict) and t.get('name') == tag_name), None)
+                if tag_obj and tag_obj.get('protected'):
+                    protected_tags.append(tag_name)
+            
+            if protected_tags:
+                log(f"WARNING: The following tags are PROTECTED and cannot be deleted: {', '.join(protected_tags)}", "ERROR")
+                log("Protected tags will be skipped during tag orchestration.", "WARN")
+                if not prompt_yes_no("Continue with non-protected tags only?", default=False):
+                    log("Tag orchestration cancelled by user.", "INFO")
+                    return
+                # Remove protected tags from selection
+                selected_tag_names = [t for t in selected_tag_names if t not in protected_tags]
+                if not selected_tag_names:
+                    log("No non-protected tags remaining; skipping tag orchestration.", "INFO")
+                    return
+            
             if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False):
                 log("Tag orchestration cancelled by user.", "INFO")
             else:
@@ -731,7 +861,11 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
 
                     exists_locally = tag_obj is not None
                     if exists_locally:
-                        log(f"Tag '{tag}' exists and will be deleted (unless skipped by rules above).", "INFO")
+                        # Double-check it's not protected before deleting
+                        if tag_obj.get('protected'):
+                            log(f"Skipping PROTECTED tag '{tag}' - cannot delete.", "ERROR")
+                            continue
+                        log(f"Tag '{tag}' exists and will be deleted.", "INFO")
                         api_call(f"projects/{pid}/repository/tags/{quoted_tag}", method="DELETE", dry_run=dry_run)
 
                     t_res = api_call(f"projects/{pid}/repository/tags", "POST", {"tag_name": tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
