@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""
-Batch Java migration helper for GitLab projects.
-
-Modifications:
-- Token is provided directly with --token (or by editing the TOKEN constant).
-- Client-side batching: --batch-size and --batch-delay.
-- api_call raises on transient HTTP errors (429 and 5xx) so the retry() decorator can back off and retry.
-- Encapsulated per-project processing and batch runner.
-- Fixed regex replacement ambiguity (avoids "invalid group reference" errors).
-- **NEW: Conflict detection before committing changes**
-
-Usage:
-  python3 mediwise_batch_migration.py --token "GLAB_..." --batch-size 3 --batch-delay 30
-"""
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -109,7 +94,31 @@ def load_token_from_file(debug=False):
                         if key in ('GITLAB_TOKEN', 'TOKEN'):
                             log(f"Token loaded from .env file (key: {key})", "INFO")
                             if debug:
-                                log(f"Token length
+                                log(f"Token length: {len(value)} characters", "DEBUG")
+                            return value
+        except Exception as e:
+            log(f"Error reading .env file: {e}", "WARN")
+    
+    # Try token.txt file
+    token_file = os.path.join(script_dir, 'token.txt')
+    if debug:
+        log(f"Looking for token.txt file at: {token_file}", "DEBUG")
+        log(f"token.txt file exists: {os.path.exists(token_file)}", "DEBUG")
+    
+    if os.path.exists(token_file):
+        try:
+            with open(token_file, 'r') as f:
+                token = f.read().strip()
+                if token:
+                    log("Token loaded from token.txt file", "INFO")
+                    if debug:
+                        log(f"Token length: {len(token)} characters", "DEBUG")
+                    return token
+        except Exception as e:
+            log(f"Error reading token.txt file: {e}", "WARN")
+    
+    return None
+
 
 
 
@@ -901,7 +910,7 @@ def process_in_batches(project_ids, batch_size=3, batch_delay=30, **kwargs):
 
 
 def main():
-    global TOKEN, PROJECT_IDS
+    global TOKEN, PROJECT_IDS, BASE_URL
 
     parser = argparse.ArgumentParser(description="Batch Java migration helper for GitLab projects.")
     parser.add_argument("--projects", help="Comma-separated project IDs to process (overrides PROJECT_IDS)", default="")
@@ -912,17 +921,15 @@ def main():
     parser.add_argument("--batch-size", type=int, default=3, help="Number of projects to process per batch (default: 3)")
     parser.add_argument("--batch-delay", type=int, default=30, help="Seconds to sleep between batches (default: 30)")
     parser.add_argument("--token", help="GitLab private token string (overrides file-based tokens)", default="")
+    parser.add_argument("--base-url", help="GitLab API base URL (overrides .env and script constant)", default="")
     args = parser.parse_args()
 
     dry_run = args.dry_run
     skip_mr = args.skip_mr
     show_full = args.full_diff and not args.summary_only
 
-    # Token loading priority:
-    # 1. Command line argument (--token)
-    # 2. .env file (GITLAB_TOKEN or TOKEN)
-    # 3. token.txt file
-    # 4. TOKEN constant in script (if set)
+    # Load configuration from file if not already set
+    # Priority: command line > .env file > script constant
     
     if args.token:
         TOKEN = args.token.strip()
@@ -934,11 +941,43 @@ def main():
             TOKEN = file_token
         else:
             log("No token found in .env or token.txt files", "WARN")
+    
+    # Load BASE_URL if provided via command line or .env
+    if args.base_url:
+        BASE_URL = args.base_url.strip().rstrip('/')
+        log(f"Using BASE_URL from command line: {BASE_URL}", "INFO")
+    else:
+        # Try to load BASE_URL from .env
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            env_file = os.path.join(script_dir, '.env')
+            if os.path.exists(env_file):
+                with open(env_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            key = key.strip()
+                            value = value.strip()
+                            # Remove quotes
+                            if value.startswith('"') and value.endswith('"'):
+                                value = value[1:-1]
+                            elif value.startswith("'") and value.endswith("'"):
+                                value = value[1:-1]
+                            
+                            if key in ('BASE_URL', 'GITLAB_BASE_URL', 'GITLAB_URL'):
+                                BASE_URL = value.rstrip('/')
+                                log(f"BASE_URL loaded from .env file: {BASE_URL}", "INFO")
+                                break
+        except Exception as e:
+            log(f"Error loading BASE_URL from .env: {e}", "WARN")
 
     if not TOKEN:
         log("No token supplied. Please provide token via:", "ERROR")
         log("  1. --token command line argument", "ERROR")
-        log("  2. .env file (GITLAB_TOKEN=your_token)", "ERROR")
+        log("  2. .env file (GITLAB_TOKEN=your_token or TOKEN=your_token)", "ERROR")
         log("  3. token.txt file in script directory", "ERROR")
         log("  4. Edit TOKEN constant in the script", "ERROR")
         sys.exit(1)
