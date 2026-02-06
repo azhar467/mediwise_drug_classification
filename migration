@@ -1,3 +1,17 @@
+#!/usr/bin/env python3
+"""
+Batch Java migration helper for GitLab projects.
+
+Modifications:
+- Token is provided directly with --token (or by editing the TOKEN constant).
+- Client-side batching: --batch-size and --batch-delay.
+- api_call raises on transient HTTP errors (429 and 5xx) so the retry() decorator can back off and retry.
+- Encapsulated per-project processing and batch runner.
+- Fixed regex replacement ambiguity (avoids "invalid group reference" errors).
+
+Usage:
+  python3 mediwise_batch_migration.py --token "GLAB_..." --batch-size 3 --batch-delay 30
+"""
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -53,6 +67,15 @@ def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
 
 @retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,))
 def api_call(endpoint, method="GET", data=None, dry_run=False):
+    """
+    Wrapper for GitLab API calls.
+
+    Behavior:
+      - If dry_run=True and method != "GET", logs and returns sensible empty structures.
+      - Raises exceptions on HTTP 429 or any 5xx to allow retry/backoff.
+      - For other HTTP errors (4xx except 429) returns a dict with {"error": True, "details": "..."}
+      - On success returns parsed JSON or {} when response body empty.
+    """
     url = f"{BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     if dry_run and method != "GET":
         log(f"(dry-run) Would call: {method} {url} with data: {json.dumps(data) if data else None}", "DRY")
@@ -93,8 +116,10 @@ def api_call(endpoint, method="GET", data=None, dry_run=False):
 
 def update_parent_block(match):
     block = match.group(0)
+    # replace the inner <version>...</version> with the target version
     block = re.sub(r"<version>.*?</version>", f"<version>{TARGET_PARENT_VERSION}</version>", block)
-    block = re.sub(r"(parent-pom-).*?(\.xml)", rf"\1{TARGET_PARENT_VERSION}\2", block)
+    # Use a callable replacement to avoid ambiguous backreference parsing (e.g. "\11")
+    block = re.sub(r"(parent-pom-).*?(\.xml)", lambda m: m.group(1) + TARGET_PARENT_VERSION + m.group(2), block)
     return block
 
 
@@ -325,7 +350,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
     else:
         log(f"No proposed changes for {p_name}.", "INFO")
 
-    # Merge request handling (same logic as before)
+    # Merge request handling
     if not skip_mr:
         try:
             existing = api_call(f"projects/{pid}/merge_requests?state=opened&source_branch={urllib.parse.quote(FEATURE_BRANCH, safe='')}")
@@ -363,7 +388,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
     else:
         log("Skip MR flag is set; not creating a merge request.", "INFO")
 
-    # Tag orchestration (same as before)
+    # Tag orchestration
     do_orch = prompt_yes_no("Trigger tags/deployment? (y/n)", default=False)
     if do_orch:
         tags_resp = fetch_all_tags_for_project(pid)
