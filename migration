@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+Batch Java migration helper for GitLab projects.
+
+Modifications:
+- Token is provided directly with --token (or by editing the TOKEN constant).
+- Client-side batching: --batch-size and --batch-delay.
+- api_call raises on transient HTTP errors (429 and 5xx) so the retry() decorator can back off and retry.
+- Encapsulated per-project processing and batch runner.
+- Fixed regex replacement ambiguity (avoids "invalid group reference" errors).
+- **NEW: Conflict detection before committing changes**
+
+Usage:
+  python3 mediwise_batch_migration.py --token "GLAB_..." --batch-size 3 --batch-delay 30
+"""
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -120,6 +135,44 @@ def load_token_from_file(debug=False):
     return None
 
 
+
+
+def extract_company_domain_from_url(url):
+    """
+    Extract company domain from GitLab URL.
+    
+    Examples:
+    - https://gitlab.company-domain.com/api/v4 -> company-domain.com
+    - https://gitlab.acme.io/api/v4 -> acme.io
+    - https://git.internal.corp/api/v4 -> internal.corp
+    - https://gitlab.lfg/api/v4 -> lfg
+    - https://gitlab.lfg.local/api/v4 -> lfg.local
+    
+    Returns the domain or None if unable to extract.
+    """
+    try:
+        import re
+        # Remove protocol and api path
+        cleaned = re.sub(r'^https?://', '', url)
+        cleaned = re.sub(r'/api/.*$', '', cleaned)
+        cleaned = re.sub(r':\d+$', '', cleaned)  # Remove port if present
+        
+        # Extract domain (remove 'gitlab.' prefix if present)
+        if cleaned.startswith('gitlab.'):
+            domain = cleaned[7:]  # Remove 'gitlab.' prefix
+        elif cleaned.startswith('git.'):
+            domain = cleaned[4:]  # Remove 'git.' prefix
+        else:
+            domain = cleaned
+        
+        # Return domain if it looks valid
+        # Accept even short domains like 'lfg' (minimum 2 chars)
+        if len(domain) >= 2:
+            return domain
+        
+        return None
+    except Exception:
+        return None
 
 
 def retry(tries=3, delay=1, backoff=2, allowed_exceptions=(Exception,)):
@@ -530,7 +583,7 @@ def handle_conflict(conflict_info, pid, p_name):
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
-def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None):
+def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None, force_tags=False):
     project_info = api_call(f"projects/{pid}")
     p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
     log(f"--- Processing: {p_name} (project id: {pid}) ---")
@@ -785,13 +838,121 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
         
         # Log what was found
         log(f"Deployment tags found for {p_name}:", "INFO")
-        for category, tag_names in found_categories.items():
-            log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
+        if found_categories:
+            for category, tag_names in found_categories.items():
+                log(f"  {category.upper()}: {', '.join(tag_names)}", "INFO")
         
         # Log missing tags
         if missing_categories:
             for category in missing_categories:
                 log(f"  {category.upper()}: NOT FOUND", "WARN")
+        
+        # Check if both dev and test are missing
+        dev_missing = 'dev' in missing_categories
+        test_missing = 'test' in missing_categories
+        
+        if dev_missing and test_missing:
+            log(f"No dev or test tags present for project {p_name}.", "ERROR")
+            if not prompt_yes_no("Do you want to create new deployment tags on the feature branch?", default=False):
+                return
+            
+            # Ask which tags to create
+            print("\nWhich tags would you like to create?")
+            print("  1. dev (or azure-dev)")
+            print("  2. test (or azure-test)")
+            print("  3. Both dev and test")
+            print("  4. Custom tag name")
+            
+            choice = input("Enter choice [1/2/3/4]: ").strip()
+            tags_to_create = []
+            
+            # Detect naming convention from existing tags
+            has_azure_prefix = any('azure-' in t.get('name', '').lower() for t in available_tags_all if isinstance(t, dict))
+            
+            if choice == '1':
+                tags_to_create = ['azure-dev' if has_azure_prefix else 'dev']
+            elif choice == '2':
+                tags_to_create = ['azure-test' if has_azure_prefix else 'test']
+            elif choice == '3':
+                if has_azure_prefix:
+                    tags_to_create = ['azure-dev', 'azure-test']
+                else:
+                    tags_to_create = ['dev', 'test']
+            elif choice == '4':
+                custom_tag = input("Enter custom tag name: ").strip()
+                if custom_tag:
+                    tags_to_create = [custom_tag]
+            
+            if tags_to_create:
+                for tag_name in tags_to_create:
+                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
+                                   {"tag_name": tag_name, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                    if dry_run:
+                        log(f"(dry-run) Would create tag '{tag_name}' on {FEATURE_BRANCH}", "DRY")
+                    else:
+                        if not isinstance(t_res, dict) or not t_res.get("error"):
+                            created_tags.add(tag_name)
+                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                            if created_tag_commit:
+                                committed_shas.add(created_tag_commit)
+                            log(f"Created tag '{tag_name}' on {FEATURE_BRANCH}", "INFO")
+                        else:
+                            log(f"Failed to create tag '{tag_name}': {t_res.get('details')}", "ERROR")
+            return
+        
+        # If only dev is missing, suggest creating it
+        if dev_missing and not test_missing:
+            log(f"Dev tag is missing for project {p_name}.", "WARN")
+            test_tag_names = found_categories.get('test', [])
+            if test_tag_names:
+                # Detect naming convention
+                has_azure_prefix = any('azure-' in name for name in test_tag_names)
+                suggested_tag = 'azure-dev' if has_azure_prefix else 'dev'
+                
+                if prompt_yes_no(f"Test tag exists but dev tag is missing. Create '{suggested_tag}' tag?", default=False):
+                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
+                                   {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                    if dry_run:
+                        log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
+                    else:
+                        if not isinstance(t_res, dict) or not t_res.get("error"):
+                            created_tags.add(suggested_tag)
+                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                            if created_tag_commit:
+                                committed_shas.add(created_tag_commit)
+                            log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
+                            # Add to available tags for further processing
+                            available_tags.insert(0, {'name': suggested_tag, 'commit': {'id': created_tag_commit}})
+                        else:
+                            log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
+                            return
+        
+        # If only test is missing, suggest creating it
+        if test_missing and not dev_missing:
+            log(f"Test tag is missing for project {p_name}.", "WARN")
+            dev_tag_names = found_categories.get('dev', [])
+            if dev_tag_names:
+                # Detect naming convention
+                has_azure_prefix = any('azure-' in name for name in dev_tag_names)
+                suggested_tag = 'azure-test' if has_azure_prefix else 'test'
+                
+                if prompt_yes_no(f"Dev tag exists but test tag is missing. Create '{suggested_tag}' tag?", default=False):
+                    t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
+                                   {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
+                    if dry_run:
+                        log(f"(dry-run) Would create tag '{suggested_tag}' on {FEATURE_BRANCH}", "DRY")
+                    else:
+                        if not isinstance(t_res, dict) or not t_res.get("error"):
+                            created_tags.add(suggested_tag)
+                            created_tag_commit = (t_res.get('commit') or {}).get('id') if isinstance(t_res, dict) else None
+                            if created_tag_commit:
+                                committed_shas.add(created_tag_commit)
+                            log(f"Created tag '{suggested_tag}' on {FEATURE_BRANCH}", "INFO")
+                            # Add to available tags for further processing
+                            available_tags.append({'name': suggested_tag, 'commit': {'id': created_tag_commit}})
+                        else:
+                            log(f"Failed to create tag '{suggested_tag}': {t_res.get('details')}", "ERROR")
+                            return
         
         if not available_tags:
             log(f"No deployment tags (dev/test/performance) found for project {p_name}.", "WARN")
@@ -864,9 +1025,14 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                     if tag in created_tags:
                         log(f"Skipping tag '{tag}': it was created earlier in this run.", "INFO")
                         continue
-                    if tag_commit_id and feature_head and tag_commit_id == feature_head:
-                        log(f"Skipping tag '{tag}': already points to feature branch head {feature_head[:8]}.", "INFO")
+                    
+                    # Only skip if tag points to feature head AND force_tags is False
+                    if not force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
+                        log(f"Skipping tag '{tag}': already points to feature branch head {feature_head[:8]}. Use --force-tags to recreate anyway.", "INFO")
                         continue
+                    
+                    if force_tags and tag_commit_id and feature_head and tag_commit_id == feature_head:
+                        log(f"Force recreating tag '{tag}' (already at feature branch head {feature_head[:8]})", "INFO")
 
                     exists_locally = tag_obj is not None
                     if exists_locally:
@@ -918,6 +1084,7 @@ def main():
     parser.add_argument("--summary-only", help="Show only line-count summary (overrides --full-diff)", action="store_true")
     parser.add_argument("--dry-run", help="Do not perform write operations (branches, commits, MRs, tags)", action="store_true")
     parser.add_argument("--skip-mr", help="Do not create merge requests (MR creation will be skipped)", action="store_true")
+    parser.add_argument("--force-tags", help="Force tag recreation even if tag already points to feature branch head", action="store_true")
     parser.add_argument("--batch-size", type=int, default=3, help="Number of projects to process per batch (default: 3)")
     parser.add_argument("--batch-delay", type=int, default=30, help="Seconds to sleep between batches (default: 30)")
     parser.add_argument("--token", help="GitLab private token string (overrides file-based tokens)", default="")
@@ -926,6 +1093,7 @@ def main():
 
     dry_run = args.dry_run
     skip_mr = args.skip_mr
+    force_tags = args.force_tags
     show_full = args.full_diff and not args.summary_only
 
     # Load configuration from file if not already set
@@ -981,6 +1149,13 @@ def main():
         log("  3. token.txt file in script directory", "ERROR")
         log("  4. Edit TOKEN constant in the script", "ERROR")
         sys.exit(1)
+    
+    # Auto-detect company domain from BASE_URL
+    company_domain = extract_company_domain_from_url(BASE_URL)
+    if company_domain:
+        log(f"Auto-detected company domain: {company_domain}", "INFO")
+    else:
+        log(f"Could not auto-detect company domain from BASE_URL: {BASE_URL}", "WARN")
 
     project_ids = PROJECT_IDS
     if args.projects:
@@ -1002,7 +1177,7 @@ def main():
                 choices.insert(0, c)
 
     process_in_batches(project_ids, batch_size=args.batch_size, batch_delay=args.batch_delay,
-                       dry_run=dry_run, skip_mr=skip_mr, show_full=show_full, choices=choices)
+                       dry_run=dry_run, skip_mr=skip_mr, show_full=show_full, choices=choices, force_tags=force_tags)
 
     log("Batch processing complete.", "INFO")
 
