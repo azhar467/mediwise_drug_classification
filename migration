@@ -6,18 +6,17 @@ import base64
 import re
 import datetime
 import difflib
-import argparse
 import sys
 import time
 import os
 import logging
 from functools import wraps
 
-BASE_URL = ""
+BASE_URL = "https://gitlab.company-domain.com/api/v4"
 TOKEN = ""
-PROJECT_IDS = [1078, 106]
+PROJECT_IDS = [101, 102]
 
-JIRA_ID = "1293"
+JIRA_ID = "4323"
 UPGRADE_TYPE = "java17-migration"
 FEATURE_BRANCH = f"task-{JIRA_ID}-{UPGRADE_TYPE}"
 SOURCE_BRANCH = "develop"
@@ -81,18 +80,6 @@ def load_state(filename="migration_state.json"):
         return None
 
 def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
-    """
-    Create a rollback snapshot before making changes.
-    
-    Args:
-        pid: Project ID
-        p_name: Project name
-        branch_name: Branch to snapshot
-        files_to_backup: List of file paths to backup
-    
-    Returns:
-        Snapshot dict with rollback information
-    """
     snapshot = {
         'project_id': pid,
         'project_name': p_name,
@@ -649,23 +636,16 @@ def validate_and_log_token_info(token, base_url):
                 log(f"Permissions (Scopes): {', '.join(token_info['scopes'])}", "INFO")
                 
                 required_scopes = ['api', 'write_repository', 'read_repository']
-                recommended_scopes = ['read_api']
                 
                 missing_required = [s for s in required_scopes if s not in token_info['scopes']]
-                missing_recommended = [s for s in recommended_scopes if s not in token_info['scopes']]
                 
                 if missing_required:
                     log(f"  Missing REQUIRED scopes: {', '.join(missing_required)}", "WARN")
                     log("   Script may fail without these permissions!", "WARN")
-                
-                if missing_recommended:
-                    log(f"  Missing recommended scopes: {', '.join(missing_recommended)}", "INFO")
-                    log("   Some features may not work optimally", "INFO")
-                
-                if not missing_required and not missing_recommended:
-                    log(" All required and recommended scopes present", "INFO")
+                else:
+                    log(" All required scopes present", "INFO")
             else:
-                log("Permissions (Scopes): None detected (may have full access)", "WARN")
+                log("Permissions (Scopes): None detected", "WARN")
             
             log("=" * 70, "INFO")
             
@@ -1684,81 +1664,36 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
             dry_run_summary['warnings'] += 1
             dry_run_summary['issues'].extend([f"{p_name}: {w}" for w in project_summary['warnings']])
 
-def process_in_batches(project_ids, batch_size=3, batch_delay=30, per_project_prompt=False, **kwargs):
+def process_in_batches(project_ids, **kwargs):
     total = len(project_ids)
     if total == 0:
         log("No projects to process.", "INFO")
         return
-    for start in range(0, total, batch_size):
-        batch = project_ids[start:start + batch_size]
-        log(f"Starting batch {start // batch_size + 1}: projects {batch}", "INFO")
+    for pid in project_ids:
         for pid in batch:
             try:
-                if per_project_prompt:
-                    project_info = api_call(f"projects/{pid}")
-                    p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
-                    print(f"\n{'='*60}")
-                    print(f"PROJECT: {p_name} (ID: {pid})")
-                    print(f"{'='*60}")
-                    raw_choices = input(f"Select updates for {p_name} (1:POM, 2:CI, 3:EB, 4:ALL, 0:SKIP): ").replace(" ", "")
-                    
-                    if raw_choices == '0' or raw_choices.lower() == 'skip':
-                        log(f"Skipping project {p_name}", "INFO")
-                        continue
-                    
-                    proj_choices = raw_choices.split(',') if raw_choices else []
-                    if '4' in proj_choices:
-                        proj_choices = [c for c in proj_choices if c != '4']
-                        for c in ('3', '2', '1'):
-                            if c not in proj_choices:
-                                proj_choices.insert(0, c)
-                    
-                    kwargs_copy = kwargs.copy()
-                    kwargs_copy['choices'] = proj_choices
-                    process_project(pid, **kwargs_copy)
-                else:
-                    process_project(pid, **kwargs)
+                process_project(pid, **kwargs)
             except Exception as e:
                 log(f"Unexpected error processing project {pid}: {e}", "ERROR")
-        if start + batch_size < total:
-            log(f"Sleeping {batch_delay}s before next batch...", "INFO")
-            time.sleep(batch_delay)
 
 def main():
     global TOKEN, PROJECT_IDS, BASE_URL
 
-    parser = argparse.ArgumentParser(description="GitLab Migration Script")
-    parser.add_argument("--projects", default="")
-    parser.add_argument("--full-diff", action="store_true", default=True)
-    parser.add_argument("--summary-only", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--skip-mr", action="store_true")
-    parser.add_argument("--force-tags", action="store_true")
-    parser.add_argument("--auto-deploy", action="store_true")
-    parser.add_argument("--non-interactive", action="store_true")
-    parser.add_argument("--per-project-prompt", action="store_true")
-    parser.add_argument("--parallel", action="store_true")
-    parser.add_argument("--max-workers", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=3)
-    parser.add_argument("--batch-delay", type=int, default=30)
-    parser.add_argument("--token", default="")
-    parser.add_argument("--base-url", default="")
-    
-    parser.add_argument("--resume", default="")
-    parser.add_argument("--rollback", default="")
-    parser.add_argument("--log-dir", default="migration_logs")
-    
-    args = parser.parse_args()
+    DRY_RUN = False
+    SKIP_MR = False
+    FORCE_TAGS = False
+    AUTO_DEPLOY = False
+    NON_INTERACTIVE = False
+    SHOW_FULL_DIFF = True
+    LOG_DIR = "migration_logs"
+    RESUME_FILE = None
+    ROLLBACK_FILE = None
 
-    if args.rollback:
-        perform_rollback(args.rollback, dry_run=args.dry_run)
+    if ROLLBACK_FILE:
+        perform_rollback(ROLLBACK_FILE, dry_run=DRY_RUN)
         sys.exit(0)
 
-    if args.rollback:
-        perform_rollback(args.rollback, dry_run=args.dry_run)
-        sys.exit(0)
-
-    log_file = setup_file_logging(args.log_dir)
+    log_file = setup_file_logging(LOG_DIR)
     log(f"Logging to file: {log_file}", "INFO")
     
     state = {
@@ -1773,8 +1708,8 @@ def main():
     }
     
     resume_from_project = None
-    if args.resume:
-        loaded_state = load_state(args.resume)
+    if RESUME_FILE:
+        loaded_state = load_state(RESUME_FILE)
         if loaded_state:
             state = loaded_state
             completed = state.get('completed_projects', [])
@@ -1782,7 +1717,7 @@ def main():
                 resume_from_project = completed[-1]
                 log(f"Resuming from last completed project: {resume_from_project}", "INFO")
         else:
-            log(f"Could not load state from {args.resume}, starting fresh", "WARN")
+            log(f"Could not load state from {RESUME_FILE}, starting fresh", "WARN")
     
     dry_run_summary = {
         'total_projects': 0,
@@ -1792,27 +1727,20 @@ def main():
         'changes': {'pom_files': 0, 'ci_files': 0, 'eb_files': 0},
         'actions': {'commits': 0, 'mrs': 0, 'tags': 0, 'deployments': 0, 'tag_breakdown': {}},
         'issues': [],
-        'parallel': args.parallel,
-        'max_workers': args.max_workers,
         'avg_time_per_project': 150
     }
 
-    dry_run = args.dry_run
-    skip_mr = args.skip_mr
-    force_tags = args.force_tags
-    auto_deploy = args.auto_deploy or args.non_interactive
-    non_interactive = args.non_interactive
-    per_project_prompt = args.per_project_prompt and not args.non_interactive
-    parallel = args.parallel
-    max_workers = args.max_workers
-    show_full = args.full_diff and not args.summary_only
+    dry_run = DRY_RUN
+    skip_mr = SKIP_MR
+    force_tags = FORCE_TAGS
+    auto_deploy = AUTO_DEPLOY or NON_INTERACTIVE
+    non_interactive = NON_INTERACTIVE
+    show_full = SHOW_FULL_DIFF
     
-    if args.non_interactive and args.per_project_prompt:
-        log("WARNING: --non-interactive overrides --per-project-prompt. Running in non-interactive mode.", "WARN")
 
     
-    if args.token:
-        TOKEN = args.token.strip()
+    if False:
+        
         log("Using token from command line argument", "INFO")
     elif not TOKEN:
         file_token = load_token_from_file()
@@ -1821,8 +1749,8 @@ def main():
         else:
             log("No token found in .env or token.txt files", "WARN")
     
-    if args.base_url:
-        BASE_URL = args.base_url.strip().rstrip('/')
+    if False:
+        
         log(f"Using BASE_URL from command line: {BASE_URL}", "INFO")
     else:
         try:
@@ -1852,10 +1780,9 @@ def main():
 
     if not TOKEN:
         log("No token supplied. Please provide token via:", "ERROR")
-        log("  1. --token command line argument", "ERROR")
-        log("  2. .env file (GITLAB_TOKEN=your_token or TOKEN=your_token)", "ERROR")
-        log("  3. token.txt file in script directory", "ERROR")
-        log("  4. Edit TOKEN constant in the script", "ERROR")
+        log("  1. .env file (GITLAB_TOKEN=your_token or TOKEN=your_token)", "ERROR")
+        log("  2. token.txt file in script directory", "ERROR")
+        log("  3. Edit TOKEN constant at top of script", "ERROR")
         sys.exit(1)
     
     company_domain = extract_company_domain_from_url(BASE_URL)
@@ -1872,15 +1799,12 @@ def main():
         sys.exit(1)
 
     project_ids = PROJECT_IDS
-    if args.projects:
-        try:
-            project_ids = [int(x.strip()) for x in args.projects.split(",") if x.strip()]
-        except Exception:
-            log("Invalid --projects value. Provide comma-separated integers.", "ERROR")
-            sys.exit(1)
+    
     if not project_ids:
-        log("Please add PROJECT_IDS or pass --projects.", "ERROR")
+        log("Please configure PROJECT_IDS at top of script.", "ERROR")
         sys.exit(1)
+    
+    log(f"Total projects to process: {len(project_ids)}", "INFO")
     
     dry_run_summary['total_projects'] = len(project_ids)
     
@@ -1891,9 +1815,10 @@ def main():
         skipped_count = original_count - len(project_ids)
         if skipped_count > 0:
             log(f"Skipping {skipped_count} already completed project(s)", "INFO")
+            log(f"Remaining projects to process: {len(project_ids)}", "INFO")
             dry_run_summary['total_projects'] = len(project_ids)
     
-    if not args.non_interactive and not any([args.per_project_prompt, args.parallel, args.auto_deploy]):
+    if not non_interactive and not auto_deploy:
         print("\n" + "="*70)
         print("EXECUTION MODE SELECTION")
         print("="*70)
@@ -1923,7 +1848,7 @@ def main():
     elif non_interactive:
         log("Running in SINGLE-SHOT MODE (--non-interactive): All actions will proceed automatically", "INFO")
     
-    if not args.dry_run and not hasattr(args, '_dry_run_asked'):
+    if not dry_run:
         print("\n" + "="*70)
         print("DRY-RUN MODE SELECTION")
         print("="*70)
@@ -1970,7 +1895,7 @@ def main():
             elif confirm not in ('y', 'yes'):
                 log("User chose not to proceed with actual run. Exiting.", "INFO")
                 sys.exit(0)
-    elif args.dry_run:
+    else:
         print("\n" + " " + "="*66)
         print(" RUNNING IN DRY-RUN MODE (SIMULATION ONLY)")
         print(" NO ACTUAL CHANGES WILL BE COMMITTED TO GITLAB")
@@ -2042,7 +1967,7 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             executor.map(process_with_lock, project_ids)
     else:
-        process_in_batches(project_ids, batch_size=args.batch_size, batch_delay=args.batch_delay,
+        process_in_batches(project_ids,
                           dry_run=dry_run, skip_mr=skip_mr, show_full=show_full, choices=global_choices, 
                           force_tags=force_tags, auto_deploy=auto_deploy, per_project_prompt=per_project_prompt,
                           non_interactive=non_interactive, state=state, rollback_data=rollback_data,
