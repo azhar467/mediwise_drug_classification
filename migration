@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+Batch Java migration helper for GitLab projects.
+
+Modifications:
+- Token is provided directly with --token (or by editing the TOKEN constant).
+- Client-side batching: --batch-size and --batch-delay.
+- api_call raises on transient HTTP errors (429 and 5xx) so the retry() decorator can back off and retry.
+- Encapsulated per-project processing and batch runner.
+- Fixed regex replacement ambiguity (avoids "invalid group reference" errors).
+- **NEW: Conflict detection before committing changes**
+
+Usage:
+  python3 mediwise_batch_migration.py --token "GLAB_..." --batch-size 3 --batch-delay 30
+"""
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -10,6 +25,7 @@ import argparse
 import sys
 import time
 import os
+import logging
 from functools import wraps
 
 # --- CONFIGURATION (edit as needed) ---
@@ -28,9 +44,244 @@ NEW_DEFAULT_PLATFORM = "arn:aws:elasticbeanstalk:us-east-1::platform/Corretto 17
 # ---------------------------------------------------------
 
 
+# Global variables for state management
+STATE_FILE = None
+ROLLBACK_FILE = None
+FILE_LOGGER = None
+
+
+def setup_file_logging(log_dir="migration_logs"):
+    """
+    Setup file logging with both file and console output.
+    Creates timestamped log files for audit trail.
+    """
+    global FILE_LOGGER
+    
+    # Create log directory if it doesn't exist
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create timestamped log filename
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"migration_{timestamp}.log")
+    
+    # Setup logging
+    FILE_LOGGER = logging.getLogger('migration')
+    FILE_LOGGER.setLevel(logging.DEBUG)
+    
+    # File handler - detailed logs
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    file_handler.setFormatter(file_formatter)
+    
+    # Add handler
+    FILE_LOGGER.addHandler(file_handler)
+    
+    return log_file
+
+
+def save_state(state_data, filename="migration_state.json"):
+    """Save migration state to file for resume capability."""
+    global STATE_FILE
+    STATE_FILE = filename
+    
+    state_data['last_updated'] = datetime.datetime.now().isoformat()
+    
+    with open(filename, 'w') as f:
+        json.dump(state_data, f, indent=2)
+    
+    log(f"State saved to {filename}", "DEBUG")
+
+
+def load_state(filename="migration_state.json"):
+    """Load migration state from file."""
+    if not os.path.exists(filename):
+        return None
+    
+    try:
+        with open(filename, 'r') as f:
+            state = json.load(f)
+        log(f"State loaded from {filename}", "INFO")
+        return state
+    except Exception as e:
+        log(f"Error loading state from {filename}: {e}", "ERROR")
+        return None
+
+
+def create_rollback_snapshot(pid, p_name, branch_name, files_to_backup):
+    """
+    Create a rollback snapshot before making changes.
+    
+    Args:
+        pid: Project ID
+        p_name: Project name
+        branch_name: Branch to snapshot
+        files_to_backup: List of file paths to backup
+    
+    Returns:
+        Snapshot dict with rollback information
+    """
+    snapshot = {
+        'project_id': pid,
+        'project_name': p_name,
+        'branch': branch_name,
+        'timestamp': datetime.datetime.now().isoformat(),
+        'files': {}
+    }
+    
+    # Get current branch head
+    try:
+        br_info = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(branch_name, safe='')}")
+        if isinstance(br_info, dict) and "commit" in br_info:
+            snapshot['commit_sha'] = (br_info.get("commit") or {}).get("id")
+        else:
+            snapshot['commit_sha'] = None
+    except Exception as e:
+        log(f"Could not get branch head for rollback snapshot: {e}", "WARN")
+        snapshot['commit_sha'] = None
+    
+    # Backup file contents
+    for file_path in files_to_backup:
+        try:
+            quoted_path = urllib.parse.quote(file_path, safe='')
+            res = api_call(f"projects/{pid}/repository/files/{quoted_path}?ref={urllib.parse.quote(branch_name, safe='')}")
+            
+            if isinstance(res, dict) and "content" in res:
+                content = base64.b64decode(res['content']).decode('utf-8')
+                snapshot['files'][file_path] = {
+                    'content': content,
+                    'exists': True
+                }
+            else:
+                snapshot['files'][file_path] = {
+                    'content': None,
+                    'exists': False
+                }
+        except Exception as e:
+            log(f"Could not backup {file_path} for rollback: {e}", "WARN")
+            snapshot['files'][file_path] = {
+                'content': None,
+                'exists': False,
+                'error': str(e)
+            }
+    
+    return snapshot
+
+
+def save_rollback_data(rollback_data, filename="rollback_data.json"):
+    """Save rollback snapshots to file."""
+    global ROLLBACK_FILE
+    ROLLBACK_FILE = filename
+    
+    rollback_data['created_at'] = datetime.datetime.now().isoformat()
+    
+    with open(filename, 'w') as f:
+        json.dump(rollback_data, f, indent=2)
+    
+    log(f"Rollback data saved to {filename}", "INFO")
+
+
+def load_rollback_data(filename="rollback_data.json"):
+    """Load rollback data from file."""
+    if not os.path.exists(filename):
+        log(f"Rollback file {filename} not found", "ERROR")
+        return None
+    
+    try:
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        log(f"Rollback data loaded from {filename}", "INFO")
+        return data
+    except Exception as e:
+        log(f"Error loading rollback data: {e}", "ERROR")
+        return None
+
+
+def perform_rollback(rollback_file, dry_run=False):
+    """
+    Rollback changes from a previous migration.
+    
+    Args:
+        rollback_file: Path to rollback JSON file
+        dry_run: If True, only show what would be rolled back
+    """
+    log("=" * 70, "INFO")
+    log("ROLLBACK MODE", "INFO")
+    log("=" * 70, "INFO")
+    
+    data = load_rollback_data(rollback_file)
+    if not data:
+        return
+    
+    snapshots = data.get('snapshots', [])
+    
+    if not snapshots:
+        log("No snapshots found in rollback file", "WARN")
+        return
+    
+    log(f"Found {len(snapshots)} project(s) to rollback", "INFO")
+    log(f"Rollback file created: {data.get('created_at', 'unknown')}", "INFO")
+    
+    for snapshot in snapshots:
+        pid = snapshot['project_id']
+        p_name = snapshot['project_name']
+        branch = snapshot['branch']
+        
+        log(f"\n--- Rollback: {p_name} (ID: {pid}) ---", "INFO")
+        
+        if dry_run:
+            log(f"(dry-run) Would rollback {p_name} to commit {snapshot.get('commit_sha', 'unknown')[:8]}", "INFO")
+            log(f"(dry-run) Would restore {len(snapshot.get('files', {}))} file(s)", "INFO")
+            continue
+        
+        # Restore files
+        for file_path, file_data in snapshot.get('files', {}).items():
+            if not file_data.get('exists'):
+                log(f"File {file_path} did not exist before, skipping restore", "INFO")
+                continue
+            
+            content = file_data.get('content')
+            if content is None:
+                log(f"No backup content for {file_path}, skipping", "WARN")
+                continue
+            
+            try:
+                # Update file to previous content
+                encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+                quoted_path = urllib.parse.quote(file_path, safe='')
+                
+                commit_data = {
+                    "branch": branch,
+                    "commit_message": f"Rollback: Restore {file_path} to pre-migration state",
+                    "actions": [{
+                        "action": "update",
+                        "file_path": file_path,
+                        "content": content
+                    }]
+                }
+                
+                api_call(f"projects/{pid}/repository/commits", "POST", commit_data)
+                log(f"Restored {file_path}", "INFO")
+                
+            except Exception as e:
+                log(f"Error restoring {file_path}: {e}", "ERROR")
+        
+        log(f"✓ Rollback completed for {p_name}", "INFO")
+    
+    log("\n" + "=" * 70, "INFO")
+    log("ROLLBACK COMPLETE", "INFO")
+    log("=" * 70, "INFO")
+
+
 def log(msg, level="INFO"):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] [{level}] {msg}")
+    console_msg = f"[{timestamp}] [{level}] {msg}"
+    print(console_msg)
+    
+    # Also log to file if file logger is setup
+    if FILE_LOGGER:
+        log_level = getattr(logging, level, logging.INFO)
+        FILE_LOGGER.log(log_level, msg)
 
 
 def load_token_from_file(debug=False):
@@ -300,6 +551,224 @@ def map_tag_to_deploy_job(tag_name):
     return deploy_jobs.get(tag_lower)
 
 
+def generate_dry_run_summary(summary_data):
+    """
+    Generate and display a comprehensive dry-run summary.
+    
+    Args:
+        summary_data: Dict with dry-run statistics
+    """
+    print("\n" + "=" * 70)
+    print("DRY-RUN SUMMARY")
+    print("=" * 70)
+    
+    # Projects overview
+    total = summary_data.get('total_projects', 0)
+    would_succeed = summary_data.get('would_succeed', 0)
+    warnings = summary_data.get('warnings', 0)
+    would_fail = summary_data.get('would_fail', 0)
+    
+    print(f"\nTotal Projects: {total}")
+    if would_succeed > 0:
+        print(f"  ✓ Would succeed: {would_succeed}")
+    if warnings > 0:
+        print(f"  ⚠️  Warnings: {warnings}")
+    if would_fail > 0:
+        print(f"  ❌ Would fail: {would_fail}")
+    
+    # Changes overview
+    changes = summary_data.get('changes', {})
+    if changes:
+        print(f"\nChanges Overview:")
+        if changes.get('pom_files', 0) > 0:
+            print(f"  POM files: {changes['pom_files']}")
+        if changes.get('ci_files', 0) > 0:
+            print(f"  CI files: {changes['ci_files']}")
+        if changes.get('eb_files', 0) > 0:
+            print(f"  EB files: {changes['eb_files']}")
+    
+    # Actions overview
+    actions = summary_data.get('actions', {})
+    if actions:
+        print(f"\nActions:")
+        if actions.get('commits', 0) > 0:
+            print(f"  Commits: {actions['commits']}")
+        if actions.get('mrs', 0) > 0:
+            print(f"  MRs: {actions['mrs']}")
+        if actions.get('tags', 0) > 0:
+            print(f"  Tags: {actions['tags']}")
+            tag_breakdown = actions.get('tag_breakdown', {})
+            if tag_breakdown:
+                for tag_type, count in tag_breakdown.items():
+                    print(f"    {tag_type}: {count}")
+        if actions.get('deployments', 0) > 0:
+            print(f"  Deployments: {actions['deployments']}")
+    
+    # Time estimate
+    avg_time = summary_data.get('avg_time_per_project', 150)  # seconds
+    total_time_seconds = total * avg_time
+    
+    if summary_data.get('parallel', False):
+        workers = summary_data.get('max_workers', 1)
+        total_time_seconds = total_time_seconds / workers
+    
+    hours = int(total_time_seconds // 3600)
+    minutes = int((total_time_seconds % 3600) // 60)
+    
+    print(f"\nEstimated Time: ", end="")
+    if hours > 0:
+        print(f"{hours}h ", end="")
+    print(f"{minutes}m")
+    
+    # Issues found
+    issues = summary_data.get('issues', [])
+    if issues:
+        print(f"\n⚠️  Issues Found:")
+        for issue in issues[:10]:  # Show first 10
+            print(f"  - {issue}")
+        if len(issues) > 10:
+            print(f"  ... and {len(issues) - 10} more")
+    
+    print("\n" + "=" * 70)
+    
+    # Save summary to file
+    summary_file = f"dry_run_summary_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(summary_file, 'w') as f:
+        json.dump(summary_data, f, indent=2)
+    
+    log(f"Dry-run summary saved to {summary_file}", "INFO")
+    
+    # Final reminder
+    print("\n" + "🔍 " + "="*66)
+    print("🔍 DRY-RUN COMPLETE - THIS WAS A SIMULATION ONLY")
+    print("🔍 NO ACTUAL CHANGES WERE MADE TO GITLAB")
+    print("🔍 " + "="*66)
+    print("\nTo run for real and make actual changes:")
+    print(f"  python3 {sys.argv[0]} --projects <your-projects>")
+    print("\nOr run again without --dry-run flag\n")
+
+
+def validate_and_log_token_info(token, base_url):
+    """
+    Validate the GitLab token and log its metadata including expiry date and scopes.
+    
+    Returns:
+        dict with 'valid' (bool) and 'info' (dict with token details)
+    """
+    if not token:
+        return {'valid': False, 'info': None}
+    
+    try:
+        # Call the personal access tokens endpoint to get token info
+        # Note: This requires the token to have 'read_api' scope
+        url = f"{base_url.rstrip('/')}/personal_access_tokens/self"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("PRIVATE-TOKEN", token)
+        req.add_header("Content-Type", "application/json")
+        
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            
+            # Extract token information
+            token_info = {
+                'id': data.get('id'),
+                'name': data.get('name', 'N/A'),
+                'scopes': data.get('scopes', []),
+                'created_at': data.get('created_at'),
+                'expires_at': data.get('expires_at'),
+                'active': data.get('active', False),
+                'revoked': data.get('revoked', False)
+            }
+            
+            # Log token information
+            log("=" * 70, "INFO")
+            log("GitLab Token Information:", "INFO")
+            log("=" * 70, "INFO")
+            log(f"Token Name: {token_info['name']}", "INFO")
+            log(f"Token ID: {token_info['id']}", "INFO")
+            log(f"Active: {'Yes' if token_info['active'] else 'No'}", "INFO")
+            log(f"Revoked: {'Yes' if token_info['revoked'] else 'No'}", "INFO")
+            
+            # Parse and display expiry date
+            if token_info['expires_at']:
+                try:
+                    from datetime import datetime
+                    expiry_dt = datetime.fromisoformat(token_info['expires_at'].replace('Z', '+00:00'))
+                    now_dt = datetime.now(expiry_dt.tzinfo)
+                    
+                    # Format expiry date
+                    expiry_str = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    log(f"Expires At: {expiry_str}", "INFO")
+                    
+                    # Calculate days until expiry
+                    days_until_expiry = (expiry_dt - now_dt).days
+                    
+                    if days_until_expiry < 0:
+                        log(f"⚠️  TOKEN EXPIRED {abs(days_until_expiry)} days ago!", "ERROR")
+                    elif days_until_expiry == 0:
+                        log(f"⚠️  TOKEN EXPIRES TODAY!", "WARN")
+                    elif days_until_expiry <= 7:
+                        log(f"⚠️  Token expires in {days_until_expiry} days", "WARN")
+                    elif days_until_expiry <= 30:
+                        log(f"Token expires in {days_until_expiry} days", "INFO")
+                    else:
+                        log(f"Token expires in {days_until_expiry} days", "INFO")
+                        
+                except Exception as e:
+                    log(f"Expires At: {token_info['expires_at']}", "INFO")
+                    log(f"Could not parse expiry date: {e}", "WARN")
+            else:
+                log("Expires At: Never (no expiration set)", "INFO")
+            
+            # Display scopes/permissions
+            if token_info['scopes']:
+                log(f"Permissions (Scopes): {', '.join(token_info['scopes'])}", "INFO")
+                
+                # Check for required scopes
+                required_scopes = ['api', 'write_repository', 'read_repository']
+                recommended_scopes = ['read_api']
+                
+                missing_required = [s for s in required_scopes if s not in token_info['scopes']]
+                missing_recommended = [s for s in recommended_scopes if s not in token_info['scopes']]
+                
+                if missing_required:
+                    log(f"⚠️  Missing REQUIRED scopes: {', '.join(missing_required)}", "WARN")
+                    log("   Script may fail without these permissions!", "WARN")
+                
+                if missing_recommended:
+                    log(f"ℹ️  Missing recommended scopes: {', '.join(missing_recommended)}", "INFO")
+                    log("   Some features may not work optimally", "INFO")
+                
+                if not missing_required and not missing_recommended:
+                    log("✓ All required and recommended scopes present", "INFO")
+            else:
+                log("Permissions (Scopes): None detected (may have full access)", "WARN")
+            
+            log("=" * 70, "INFO")
+            
+            return {'valid': True, 'info': token_info}
+            
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # Endpoint not available - older GitLab version or token doesn't have read_api scope
+            log("=" * 70, "WARN")
+            log("Could not fetch detailed token information", "WARN")
+            log("This may be due to:", "WARN")
+            log("  - Token missing 'read_api' scope", "WARN")
+            log("  - GitLab version doesn't support this endpoint", "WARN")
+            log("=" * 70, "WARN")
+            return {'valid': True, 'info': None}
+        elif e.code == 401:
+            log("Token validation failed: Invalid or expired token", "ERROR")
+            return {'valid': False, 'info': None}
+        else:
+            log(f"Error validating token: HTTP {e.code}", "WARN")
+            return {'valid': True, 'info': None}  # Assume valid, continue
+    except Exception as e:
+        log(f"Error fetching token information: {e}", "WARN")
+        return {'valid': True, 'info': None}  # Assume valid, continue
+
+
 def extract_company_domain_from_url(url):
     """
     Extract company domain from GitLab URL.
@@ -422,7 +891,12 @@ def show_unified_diff(path, old, new):
     return ud
 
 
-def prompt_yes_no(prompt, default=False):
+def prompt_yes_no(prompt, default=False, non_interactive=False):
+    if non_interactive:
+        # In non-interactive mode, always return default
+        log(f"{prompt} [auto: {'yes' if default else 'no'}]", "INFO")
+        return default
+    
     try:
         ans = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
     except EOFError:
@@ -746,7 +1220,9 @@ def handle_conflict(conflict_info, pid, p_name):
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
-def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None, force_tags=False, auto_deploy=False):
+def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=None, force_tags=False, auto_deploy=False, non_interactive=False, state=None, rollback_data=None, dry_run_summary=None):
+    project_start_time = time.time()
+    
     project_info = api_call(f"projects/{pid}")
     p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
     log(f"--- Processing: {p_name} (project id: {pid}) ---")
@@ -754,6 +1230,13 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
 
     committed_shas = set()
     created_tags = set()
+    
+    # Track for dry-run summary
+    project_summary = {
+        'success': True,
+        'warnings': [],
+        'changes': []
+    }
 
     br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
     current_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else SOURCE_BRANCH
@@ -820,8 +1303,27 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                 added = len([l for l in diff if l.startswith('+ ')])
                 removed = len([l for l in diff if l.startswith('- ')])
                 print(f"   {action['file_path']} -> [+{added} | -{removed} lines]")
+            
+            # Track for dry-run summary
+            if dry_run_summary is not None:
+                project_summary['changes'].append(action['file_path'])
+                if action['file_path'] == 'pom.xml':
+                    dry_run_summary['changes']['pom_files'] += 1
+                elif action['file_path'] == '.gitlab-ci.yml':
+                    dry_run_summary['changes']['ci_files'] += 1
+                elif action['file_path'] == '.elasticbeanstalk/config.yml':
+                    dry_run_summary['changes']['eb_files'] += 1
 
-        if prompt_yes_no(f"Commit changes for {p_name}?", default=False):
+        if prompt_yes_no(f"Commit changes for {p_name}?", default=False if not non_interactive else True, non_interactive=non_interactive):
+            # Create rollback snapshot before making changes
+            if not dry_run and rollback_data is not None:
+                files_to_backup = [action['file_path'] for action in actions]
+                snapshot = create_rollback_snapshot(pid, p_name, current_ref, files_to_backup)
+                rollback_data['snapshots'].append(snapshot)
+                log(f"Created rollback snapshot for {p_name}", "DEBUG")
+            
+            if dry_run_summary is not None:
+                dry_run_summary['actions']['commits'] += 1
             if not (isinstance(br_check, dict) and "name" in br_check):
                 log(f"Feature branch {FEATURE_BRANCH} not found. Creating from {SOURCE_BRANCH}...", "INFO")
                 api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
@@ -896,7 +1398,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                                 desired_ver = parse_version(TARGET_PARENT_VERSION)
                                 if remote_ver and desired_ver and remote_ver > desired_ver:
                                     log(f"Remote parent version {'.'.join(map(str,remote_ver))} is newer than desired {TARGET_PARENT_VERSION}.", "WARN")
-                                    if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade) anyway?", default=False):
+                                    if not prompt_yes_no("Remote parent version appears newer. Overwrite (downgrade, non_interactive=non_interactive) anyway?", default=False):
                                         log(f"Skipping update of {file_path} due to newer remote version.", "INFO")
                                         continue
                             commit_actions.append({"action": "update", "file_path": file_path, "content": desired})
@@ -912,7 +1414,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                         branch_head_now = (br_now.get("commit") or {}).get("id") if isinstance(br_now, dict) else None
                         if branch_head_now and branch_head_now != branch_head_before:
                             log(f"Branch {FEATURE_BRANCH} head changed from {branch_head_before[:8]} to {branch_head_now[:8]} while running. Aborting commit to avoid overwriting remote changes.", "WARN")
-                            if prompt_yes_no("Branch changed — re-evaluate changes and continue anyway?", default=False):
+                            if prompt_yes_no("Branch changed — re-evaluate changes and continue anyway?", default=False, non_interactive=non_interactive):
                                 branch_head_before = branch_head_now
                             else:
                                 log("Skipping commit for this project due to branch head change.", "INFO")
@@ -959,7 +1461,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                 log("MR already exists (could not parse response).", "INFO")
         else:
             if not (isinstance(br_check, dict) and "name" in br_check):
-                if prompt_yes_no(f"Feature branch {FEATURE_BRANCH} not found. Create it from {SOURCE_BRANCH} so an MR can be opened?", default=False):
+                if prompt_yes_no(f"Feature branch {FEATURE_BRANCH} not found. Create it from {SOURCE_BRANCH} so an MR can be opened?", default=False, non_interactive=non_interactive):
                     api_call(f"projects/{pid}/repository/branches", "POST", {"branch": FEATURE_BRANCH, "ref": SOURCE_BRANCH}, dry_run=dry_run)
                     br_check = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
                     current_ref = FEATURE_BRANCH if isinstance(br_check, dict) and "name" in br_check else SOURCE_BRANCH
@@ -969,7 +1471,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                         log(f"Failed to create or find branch {FEATURE_BRANCH}; cannot create MR.", "ERROR")
 
             if isinstance(br_check, dict) and "name" in br_check:
-                if prompt_yes_no(f"Create merge request for {p_name} from {FEATURE_BRANCH} into {SOURCE_BRANCH}?", default=True):
+                if prompt_yes_no(f"Create merge request for {p_name} from {FEATURE_BRANCH} into {SOURCE_BRANCH}?", default=True, non_interactive=non_interactive):
                     mr_payload = {"source_branch": FEATURE_BRANCH, "target_branch": SOURCE_BRANCH, "title": MR_TITLE}
                     api_call(f"projects/{pid}/merge_requests", "POST", mr_payload, dry_run=dry_run)
                     log("MR created." if not dry_run else "(dry-run) MR would be created.", "INFO")
@@ -979,7 +1481,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
         log("Skip MR flag is set; not creating a merge request.", "INFO")
 
     # Tag orchestration
-    do_orch = prompt_yes_no("Trigger tags/deployment? (y/n)", default=False)
+    do_orch = prompt_yes_no("Trigger tags/deployment? (y/n, non_interactive=non_interactive)", default=False)
     if do_orch:
         tags_resp = fetch_all_tags_for_project(pid)
         if isinstance(tags_resp, dict) and tags_resp.get("error"):
@@ -1016,7 +1518,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
         
         if dev_missing and test_missing:
             log(f"No dev or test tags present for project {p_name}.", "ERROR")
-            if not prompt_yes_no("Do you want to create new deployment tags on the feature branch?", default=False):
+            if not prompt_yes_no("Do you want to create new deployment tags on the feature branch?", default=False, non_interactive=non_interactive):
                 return
             
             # Ask which tags to create
@@ -1072,7 +1574,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                 has_azure_prefix = any('azure-' in name for name in test_tag_names)
                 suggested_tag = 'azure-dev' if has_azure_prefix else 'dev'
                 
-                if prompt_yes_no(f"Test tag exists but dev tag is missing. Create '{suggested_tag}' tag?", default=False):
+                if prompt_yes_no(f"Test tag exists but dev tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
                     t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
                                    {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
                     if dry_run:
@@ -1099,7 +1601,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                 has_azure_prefix = any('azure-' in name for name in dev_tag_names)
                 suggested_tag = 'azure-test' if has_azure_prefix else 'test'
                 
-                if prompt_yes_no(f"Dev tag exists but test tag is missing. Create '{suggested_tag}' tag?", default=False):
+                if prompt_yes_no(f"Dev tag exists but test tag is missing. Create '{suggested_tag}' tag?", default=False, non_interactive=non_interactive):
                     t_res = api_call(f"projects/{pid}/repository/tags", "POST", 
                                    {"tag_name": suggested_tag, "ref": FEATURE_BRANCH}, dry_run=dry_run)
                     if dry_run:
@@ -1119,7 +1621,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
         
         if not available_tags:
             log(f"No deployment tags (dev/test/performance) found for project {p_name}.", "WARN")
-            if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False):
+            if not prompt_yes_no("Do you want to create a new tag on the feature branch anyway?", default=False, non_interactive=non_interactive):
                 return
             new_tag_name = input("Enter tag name to create on feature branch: ").strip()
             if new_tag_name:
@@ -1160,7 +1662,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
             if protected_tags:
                 log(f"WARNING: The following tags are PROTECTED and cannot be deleted: {', '.join(protected_tags)}", "ERROR")
                 log("Protected tags will be skipped during tag orchestration.", "WARN")
-                if not prompt_yes_no("Continue with non-protected tags only?", default=False):
+                if not prompt_yes_no("Continue with non-protected tags only?", default=False, non_interactive=non_interactive):
                     log("Tag orchestration cancelled by user.", "INFO")
                     return
                 # Remove protected tags from selection
@@ -1169,7 +1671,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                     log("No non-protected tags remaining; skipping tag orchestration.", "INFO")
                     return
             
-            if not prompt_yes_no("Proceed with deleting (if present) and recreating these tags on the feature branch?", default=False):
+            if not prompt_yes_no("Proceed with deleting (if present, non_interactive=non_interactive) and recreating these tags on the feature branch?", default=False):
                 log("Tag orchestration cancelled by user.", "INFO")
             else:
                 branch_info_for_tag = api_call(f"projects/{pid}/repository/branches/{urllib.parse.quote(FEATURE_BRANCH, safe='')}")
@@ -1218,7 +1720,7 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                                 committed_shas.add(created_tag_commit)
                                 
                                 # Ask if user wants full deployment orchestration (or use --auto-deploy flag)
-                                should_deploy = auto_deploy or prompt_yes_no(f"Tag '{tag}' created. Do you want to wait for build and auto-deploy?", default=True)
+                                should_deploy = auto_deploy or prompt_yes_no(f"Tag '{tag}' created. Do you want to wait for build and auto-deploy?", default=True, non_interactive=non_interactive)
                                 
                                 if should_deploy:
                                     log(f"Starting deployment orchestration for tag '{tag}'...", "INFO")
@@ -1317,9 +1819,40 @@ def process_project(pid, dry_run=False, skip_mr=False, show_full=True, choices=N
                                         log(f"Available jobs: {', '.join([j.get('name', 'unknown') for j in jobs])}", "INFO")
                         else:
                             log(f"Failed to create tag '{tag}': {t_res.get('details')}", "ERROR")
+    
+    # Log completion time for this project
+    project_end_time = time.time()
+    project_duration = project_end_time - project_start_time
+    minutes = int(project_duration // 60)
+    seconds = int(project_duration % 60)
+    
+    if minutes > 0:
+        log(f"✓ Completed {p_name} in {minutes}m {seconds}s", "INFO")
+    else:
+        log(f"✓ Completed {p_name} in {seconds}s", "INFO")
+    
+    # Update state tracking
+    if state is not None:
+        if project_summary['success']:
+            state['completed_projects'].append(pid)
+            if dry_run_summary is not None:
+                dry_run_summary['would_succeed'] += 1
+        else:
+            state['failed_projects'].append(pid)
+            if dry_run_summary is not None:
+                dry_run_summary['would_fail'] += 1
+        
+        # Save state after each project (for resume capability)
+        save_state(state)
+    
+    # Update dry-run summary
+    if dry_run_summary is not None:
+        if project_summary['warnings']:
+            dry_run_summary['warnings'] += 1
+            dry_run_summary['issues'].extend([f"{p_name}: {w}" for w in project_summary['warnings']])
 
 
-def process_in_batches(project_ids, batch_size=3, batch_delay=30, **kwargs):
+def process_in_batches(project_ids, batch_size=3, batch_delay=30, per_project_prompt=False, **kwargs):
     total = len(project_ids)
     if total == 0:
         log("No projects to process.", "INFO")
@@ -1329,7 +1862,32 @@ def process_in_batches(project_ids, batch_size=3, batch_delay=30, **kwargs):
         log(f"Starting batch {start // batch_size + 1}: projects {batch}", "INFO")
         for pid in batch:
             try:
-                process_project(pid, **kwargs)
+                # Per-project file selection if enabled
+                if per_project_prompt:
+                    project_info = api_call(f"projects/{pid}")
+                    p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
+                    print(f"\n{'='*60}")
+                    print(f"PROJECT: {p_name} (ID: {pid})")
+                    print(f"{'='*60}")
+                    raw_choices = input(f"Select updates for {p_name} (1:POM, 2:CI, 3:EB, 4:ALL, 0:SKIP): ").replace(" ", "")
+                    
+                    if raw_choices == '0' or raw_choices.lower() == 'skip':
+                        log(f"Skipping project {p_name}", "INFO")
+                        continue
+                    
+                    proj_choices = raw_choices.split(',') if raw_choices else []
+                    if '4' in proj_choices:
+                        proj_choices = [c for c in proj_choices if c != '4']
+                        for c in ('3', '2', '1'):
+                            if c not in proj_choices:
+                                proj_choices.insert(0, c)
+                    
+                    # Override the choices in kwargs
+                    kwargs_copy = kwargs.copy()
+                    kwargs_copy['choices'] = proj_choices
+                    process_project(pid, **kwargs_copy)
+                else:
+                    process_project(pid, **kwargs)
             except Exception as e:
                 log(f"Unexpected error processing project {pid}: {e}", "ERROR")
         if start + batch_size < total:
@@ -1348,17 +1906,88 @@ def main():
     parser.add_argument("--skip-mr", help="Do not create merge requests (MR creation will be skipped)", action="store_true")
     parser.add_argument("--force-tags", help="Force tag recreation even if tag already points to feature branch head", action="store_true")
     parser.add_argument("--auto-deploy", help="Automatically wait for build and trigger deployment jobs after tag creation", action="store_true")
+    parser.add_argument("--non-interactive", help="Non-interactive mode: no prompts, auto-proceed with all actions (implies --auto-deploy)", action="store_true")
+    parser.add_argument("--per-project-prompt", help="Ask which files to modify for each project individually (default: ask once globally)", action="store_true")
+    parser.add_argument("--parallel", help="Process projects in parallel using multiple threads (experimental)", action="store_true")
+    parser.add_argument("--max-workers", type=int, default=3, help="Maximum number of parallel workers when using --parallel (default: 3)")
     parser.add_argument("--batch-size", type=int, default=3, help="Number of projects to process per batch (default: 3)")
     parser.add_argument("--batch-delay", type=int, default=30, help="Seconds to sleep between batches (default: 30)")
     parser.add_argument("--token", help="GitLab private token string (overrides file-based tokens)", default="")
     parser.add_argument("--base-url", help="GitLab API base URL (overrides .env and script constant)", default="")
+    
+    # New feature flags
+    parser.add_argument("--resume", help="Resume from a previous state file", default="")
+    parser.add_argument("--rollback", help="Rollback changes from a previous migration using rollback file", default="")
+    parser.add_argument("--log-dir", help="Directory for log files (default: migration_logs)", default="migration_logs")
+    
     args = parser.parse_args()
+
+    # Handle rollback mode
+    if args.rollback:
+        perform_rollback(args.rollback, dry_run=args.dry_run)
+        sys.exit(0)
+
+    # Handle rollback mode
+    if args.rollback:
+        perform_rollback(args.rollback, dry_run=args.dry_run)
+        sys.exit(0)
+
+    # Setup file logging
+    log_file = setup_file_logging(args.log_dir)
+    log(f"Logging to file: {log_file}", "INFO")
+    
+    # Initialize state and rollback tracking
+    state = {
+        'completed_projects': [],
+        'failed_projects': [],
+        'skipped_projects': [],
+        'start_time': datetime.datetime.now().isoformat()
+    }
+    
+    rollback_data = {
+        'snapshots': []
+    }
+    
+    # Resume from previous state if requested
+    resume_from_project = None
+    if args.resume:
+        loaded_state = load_state(args.resume)
+        if loaded_state:
+            state = loaded_state
+            completed = state.get('completed_projects', [])
+            if completed:
+                resume_from_project = completed[-1]
+                log(f"Resuming from last completed project: {resume_from_project}", "INFO")
+        else:
+            log(f"Could not load state from {args.resume}, starting fresh", "WARN")
+    
+    # Dry-run summary tracking
+    dry_run_summary = {
+        'total_projects': 0,
+        'would_succeed': 0,
+        'warnings': 0,
+        'would_fail': 0,
+        'changes': {'pom_files': 0, 'ci_files': 0, 'eb_files': 0},
+        'actions': {'commits': 0, 'mrs': 0, 'tags': 0, 'deployments': 0, 'tag_breakdown': {}},
+        'issues': [],
+        'parallel': args.parallel,
+        'max_workers': args.max_workers,
+        'avg_time_per_project': 150  # Default estimate in seconds
+    }
 
     dry_run = args.dry_run
     skip_mr = args.skip_mr
     force_tags = args.force_tags
-    auto_deploy = args.auto_deploy
+    auto_deploy = args.auto_deploy or args.non_interactive  # non-interactive implies auto-deploy
+    non_interactive = args.non_interactive
+    per_project_prompt = args.per_project_prompt and not args.non_interactive  # can't do per-project in non-interactive
+    parallel = args.parallel
+    max_workers = args.max_workers
     show_full = args.full_diff and not args.summary_only
+    
+    # Warn if conflicting flags
+    if args.non_interactive and args.per_project_prompt:
+        log("WARNING: --non-interactive overrides --per-project-prompt. Running in non-interactive mode.", "WARN")
 
     # Load configuration from file if not already set
     # Priority: command line > .env file > script constant
@@ -1420,6 +2049,14 @@ def main():
         log(f"Auto-detected company domain: {company_domain}", "INFO")
     else:
         log(f"Could not auto-detect company domain from BASE_URL: {BASE_URL}", "WARN")
+    
+    # Validate token and log metadata (expiry, scopes, etc.)
+    log("Validating GitLab token...", "INFO")
+    token_validation = validate_and_log_token_info(TOKEN, BASE_URL)
+    
+    if not token_validation['valid']:
+        log("Token validation failed. Please check your token and try again.", "ERROR")
+        sys.exit(1)
 
     project_ids = PROJECT_IDS
     if args.projects:
@@ -1431,27 +2068,207 @@ def main():
     if not project_ids:
         log("Please add PROJECT_IDS or pass --projects.", "ERROR")
         sys.exit(1)
-
-    raw_choices = input("Select updates to run (1:POM, 2:CI, 3:EB, 4:ALL, 0:EXIT), e.g. 1,2 or 4 or 0: ").replace(" ", "")
     
-    # Check for exit option
-    if raw_choices == '0' or raw_choices.lower() == 'exit':
-        log("User chose to exit. No changes will be made.", "INFO")
-        log("Exiting gracefully. Goodbye!", "INFO")
-        sys.exit(0)
+    # Set dry-run summary total
+    dry_run_summary['total_projects'] = len(project_ids)
     
-    choices = raw_choices.split(',') if raw_choices else []
-    if '4' in choices:
-        choices = [c for c in choices if c != '4']
-        for c in ('3', '2', '1'):
-            if c not in choices:
-                choices.insert(0, c)
+    # Filter out already completed projects if resuming
+    original_count = len(project_ids)
+    if resume_from_project:
+        completed_set = set(state.get('completed_projects', []))
+        project_ids = [pid for pid in project_ids if pid not in completed_set]
+        skipped_count = original_count - len(project_ids)
+        if skipped_count > 0:
+            log(f"Skipping {skipped_count} already completed project(s)", "INFO")
+            dry_run_summary['total_projects'] = len(project_ids)
+    
+    # Ask user about interactive mode if not explicitly set
+    if not args.non_interactive and not any([args.per_project_prompt, args.parallel, args.auto_deploy]):
+        print("\n" + "="*70)
+        print("EXECUTION MODE SELECTION")
+        print("="*70)
+        print("\nHow would you like to run this script?\n")
+        print("1. INTERACTIVE MODE (default)")
+        print("   - Script will ask for confirmation at each step")
+        print("   - You approve: commits, MRs, tag selection, deployments")
+        print("   - Best for: Careful review, first-time runs, small batches")
+        print()
+        print("2. SINGLE-SHOT MODE (non-interactive)")
+        print("   - Script runs automatically without asking questions")
+        print("   - Auto-commits, auto-creates MRs, auto-deploys")
+        print("   - Best for: Large batches, overnight runs, CI/CD")
+        print()
+        
+        mode_choice = input("Choose mode [1/2] (default: 1): ").strip()
+        
+        if mode_choice == '2':
+            non_interactive = True
+            auto_deploy = True
+            log("Running in SINGLE-SHOT MODE: All actions will proceed automatically", "INFO")
+        else:
+            log("Running in INTERACTIVE MODE: You will be asked to confirm each action", "INFO")
+    elif non_interactive:
+        log("Running in SINGLE-SHOT MODE (--non-interactive): All actions will proceed automatically", "INFO")
+    
+    # Ask user about dry-run mode if not explicitly set via command line
+    if not args.dry_run and not hasattr(args, '_dry_run_asked'):
+        print("\n" + "="*70)
+        print("DRY-RUN MODE SELECTION")
+        print("="*70)
+        print("\nWould you like to run in DRY-RUN mode first?\n")
+        print("🔍 DRY-RUN MODE (SIMULATION ONLY):")
+        print("   ✓ Shows all proposed changes and diffs")
+        print("   ✓ Simulates commits, MRs, tags, deployments")
+        print("   ✓ Generates summary report")
+        print("   ✓ NO actual changes made to GitLab")
+        print("   ✓ Safe to test and preview")
+        print()
+        print("⚡ ACTUAL RUN MODE (MAKES REAL CHANGES):")
+        print("   ✓ Creates real commits")
+        print("   ✓ Creates real MRs")
+        print("   ✓ Creates/recreates tags")
+        print("   ✓ Triggers actual deployments")
+        print("   ⚠️  CAUTION: This will modify GitLab!")
+        print()
+        
+        dry_run_choice = input("Run in DRY-RUN mode? [Y/n] (recommended: Y): ").strip().lower()
+        
+        if dry_run_choice in ('', 'y', 'yes'):
+            dry_run = True
+            print("\n" + "🔍 " + "="*66)
+            print("🔍 RUNNING IN DRY-RUN MODE (SIMULATION ONLY)")
+            print("🔍 NO ACTUAL CHANGES WILL BE COMMITTED TO GITLAB")
+            print("🔍 This is a safe preview of what WOULD happen")
+            print("🔍 " + "="*66 + "\n")
+            log("DRY-RUN MODE ACTIVATED: This is a simulation only", "INFO")
+        else:
+            print("\n" + "⚡ " + "="*66)
+            print("⚡ RUNNING IN ACTUAL MODE - REAL CHANGES WILL BE MADE")
+            print("⚡ WARNING: This will commit changes to GitLab!")
+            print("⚡ " + "="*66 + "\n")
+            log("ACTUAL RUN MODE: Real changes will be made to GitLab", "WARN")
+            
+            # Extra confirmation for actual mode
+            confirm = input("Are you sure you want to proceed with ACTUAL changes? [y/N]: ").strip().lower()
+            if confirm not in ('y', 'yes'):
+                log("User chose not to proceed with actual run. Exiting.", "INFO")
+                sys.exit(0)
+    elif args.dry_run:
+        print("\n" + "🔍 " + "="*66)
+        print("🔍 RUNNING IN DRY-RUN MODE (SIMULATION ONLY)")
+        print("🔍 NO ACTUAL CHANGES WILL BE COMMITTED TO GITLAB")
+        print("🔍 This is a safe preview of what WOULD happen")
+        print("🔍 " + "="*66 + "\n")
+        log("DRY-RUN MODE ACTIVATED: This is a simulation only", "INFO")
 
-    process_in_batches(project_ids, batch_size=args.batch_size, batch_delay=args.batch_delay,
-                       dry_run=dry_run, skip_mr=skip_mr, show_full=show_full, choices=choices, 
-                       force_tags=force_tags, auto_deploy=auto_deploy)
+    # Global or per-project file selection
+    global_choices = None
+    if not per_project_prompt:
+        if dry_run:
+            print("\n" + "🔍 DRY-RUN MODE: Showing what WOULD be changed (no actual commits)")
+        
+        raw_choices = input("Select updates to run for ALL projects (1:POM, 2:CI, 3:EB, 4:ALL, 0:EXIT), e.g. 1,2 or 4 or 0: ").replace(" ", "")
+        
+        # Check for exit option
+        if raw_choices == '0' or raw_choices.lower() == 'exit':
+            log("User chose to exit. No changes will be made.", "INFO")
+            log("Exiting gracefully. Goodbye!", "INFO")
+            sys.exit(0)
+        
+        global_choices = raw_choices.split(',') if raw_choices else []
+        if '4' in global_choices:
+            global_choices = [c for c in global_choices if c != '4']
+            for c in ('3', '2', '1'):
+                if c not in global_choices:
+                    global_choices.insert(0, c)
+        
+        log(f"Will apply these updates to all projects: {', '.join(['POM' if c=='1' else 'CI' if c=='2' else 'EB' if c=='3' else c for c in global_choices])}", "INFO")
+    else:
+        log("Per-project prompting enabled. You will be asked which files to modify for each project.", "INFO")
+
+    # Process projects
+    if parallel:
+        log(f"Running in PARALLEL mode with {max_workers} workers (experimental)", "WARN")
+        import concurrent.futures
+        import threading
+        
+        # Thread-safe logging
+        log_lock = threading.Lock()
+        
+        def process_with_lock(pid):
+            try:
+                # Determine choices for this project
+                if per_project_prompt:
+                    with log_lock:
+                        project_info = api_call(f"projects/{pid}")
+                        p_name = project_info.get('name', f"ID:{pid}") if isinstance(project_info, dict) else f"ID:{pid}"
+                        print(f"\n{'='*60}")
+                        print(f"PROJECT: {p_name} (ID: {pid})")
+                        print(f"{'='*60}")
+                        raw_choices = input(f"Select updates for {p_name} (1:POM, 2:CI, 3:EB, 4:ALL, 0:SKIP): ").replace(" ", "")
+                        
+                        if raw_choices == '0' or raw_choices.lower() == 'skip':
+                            log(f"Skipping project {p_name}", "INFO")
+                            return
+                        
+                        proj_choices = raw_choices.split(',') if raw_choices else []
+                        if '4' in proj_choices:
+                            proj_choices = [c for c in proj_choices if c != '4']
+                            for c in ('3', '2', '1'):
+                                if c not in proj_choices:
+                                    proj_choices.insert(0, c)
+                else:
+                    proj_choices = global_choices
+                
+                process_project(pid, dry_run=dry_run, skip_mr=skip_mr, show_full=show_full, 
+                              choices=proj_choices, force_tags=force_tags, auto_deploy=auto_deploy,
+                              non_interactive=non_interactive)
+            except Exception as e:
+                with log_lock:
+                    log(f"Error processing project {pid}: {e}", "ERROR")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor.map(process_with_lock, project_ids)
+    else:
+        # Sequential processing (original behavior)
+        process_in_batches(project_ids, batch_size=args.batch_size, batch_delay=args.batch_delay,
+                          dry_run=dry_run, skip_mr=skip_mr, show_full=show_full, choices=global_choices, 
+                          force_tags=force_tags, auto_deploy=auto_deploy, per_project_prompt=per_project_prompt,
+                          non_interactive=non_interactive, state=state, rollback_data=rollback_data,
+                          dry_run_summary=dry_run_summary)
+
+    # Save final state
+    state['end_time'] = datetime.datetime.now().isoformat()
+    save_state(state)
+    
+    # Save rollback data if any snapshots were created
+    if rollback_data['snapshots']:
+        rollback_file = f"rollback_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        save_rollback_data(rollback_data, rollback_file)
+        log(f"\n{'='*70}", "INFO")
+        log(f"Rollback file created: {rollback_file}", "INFO")
+        log(f"To rollback these changes, run:", "INFO")
+        log(f"  python3 {sys.argv[0]} --rollback {rollback_file}", "INFO")
+        log(f"{'='*70}\n", "INFO")
+    
+    # Generate dry-run summary
+    if dry_run:
+        generate_dry_run_summary(dry_run_summary)
 
     log("Batch processing complete.", "INFO")
+    log(f"Logs saved to: {log_file}", "INFO")
+    
+    # Final statistics
+    log("\n" + "="*70, "INFO")
+    log("MIGRATION SUMMARY", "INFO")
+    log("="*70, "INFO")
+    log(f"Total projects processed: {len(state.get('completed_projects', []))}", "INFO")
+    if state.get('failed_projects'):
+        log(f"Failed projects: {len(state['failed_projects'])}", "ERROR")
+        log(f"  IDs: {state['failed_projects']}", "ERROR")
+    if state.get('skipped_projects'):
+        log(f"Skipped projects: {len(state['skipped_projects'])}", "INFO")
+    log("="*70, "INFO")
 
 
 if __name__ == "__main__":
